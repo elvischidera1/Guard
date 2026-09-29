@@ -1,0 +1,39 @@
+name: Publish Android SDK
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: [Release Bot] 
+    types:
+      - completed 
+
+jobs:
+  build:
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main')  
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Validate Gradle Wrapper
+        uses: gradle/actions/wrapper-validation@0723195856401067f7a2779048b490ace7a47d7c # v5
+
+      - name: Grant Execute Permission for Gradlew
+        run: chmod +x gradlew
+
+      - name: Build & Publish to Maven Central
+        run: ./gradlew publishToSonatype closeAndReleaseSonatypeStagingRepository --no-configuration-cache
+        env:
+          ORG_GRADLE_PROJECT_SIGNING_KEY_ID: ${{ secrets.ORG_GRADLE_PROJECT_SIGNING_KEY_ID }}
+          ORG_GRADLE_PROJECT_SIGNING_PASSWORD: ${{ secrets.ORG_GRADLE_PROJECT_SIGNING_PASSWORD }}
+          ORG_GRADLE_PROJECT_SIGNING_KEY: ${{ secrets.ORG_GRADLE_PROJECT_SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_MAVEN_USERNAME: ${{ secrets.ORG_GRADLE_PROJECT_MAVEN_USERNAME }}
+          ORG_GRADLE_PROJECT_MAVEN_PASSWORD: ${{ secrets.ORG_GRADLE_PROJECT_MAVEN_PASSWORD }}

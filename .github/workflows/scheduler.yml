@@ -1,0 +1,34 @@
+name: Scheduler
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */4 * * *"
+
+jobs:
+  trigger-runs:
+    timeout-minutes: 10
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - name: Trigger Scheduled Test Runs
+        if: github.event.repository.private
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const args = {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: 'main',
+            }
+
+            // Kong
+            github.rest.actions.createWorkflowDispatch({
+              ...args,
+              workflow_id: 'kong.yml'
+            })
+
+            // Tests
+            github.rest.actions.createWorkflowDispatch({
+              ...args,
+              workflow_id: 'tests.yml'
+            })
