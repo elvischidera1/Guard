@@ -57,3 +57,7 @@ captures/
 ### macOS ###
 # General
 .DS_Store
+# JVM harness
+harness/.gradle/
+harness/**/build/
+harness/.kotlin/
