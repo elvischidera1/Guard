@@ -57,7 +57,9 @@ left in Kotlin is the public API, the model classes, and the I/O that SQL cannot
 - Parameters are `:name`. Values are bound as integer, real, text or NULL.
 - `main.*` tables hold what the original kept in SharedPreferences.
 - `temp.*` tables hold what it kept in memory. Each client owns a connection, so TEMP tables give
-  every client its own session state with no extra code.
+  every client its own session state with no extra code. When a client shuts down, the `reset`
+  block clears them and the connection (its schema and compiled statements) is kept for the next
+  client on the same database.
 - Triggers carry the rules that should hold for every write: applying a new set of values, and
   computing hashes on demand.
 - **Directives** are comment lines at the top of a block. They describe the block's data flow, so
@@ -70,6 +72,7 @@ left in Kotlin is the public API, the model classes, and the I/O that SQL cannot
   | `@defer` | Calls may be queued and run later, in order, in one transaction. The first statement runs per call; the others run once after each run of consecutive calls. | Queues calls; runs them in bulk (at 50, or before anything that depends on them). |
   | `@coalesce` | Identical queued calls may be merged (`:repeat` counts them). | Merges them. |
   | `@quiet: <ms>` | After a call that changed rows, identical calls within `<ms>` change nothing, unless something the block reads is written. | Skips such calls without touching SQLite. |
+  | `@needs: a, b` | Blocks that must have run on the connection first (schema that only some features use, e.g. the SHA-256 program or the evaluator's views). | Runs each once per connection, before the first block that needs it. |
 
   A result row may also carry `_then`: the name of a block to run with the same parameters before
   the block is run once more (a lookup uses it to have a missing hash computed).

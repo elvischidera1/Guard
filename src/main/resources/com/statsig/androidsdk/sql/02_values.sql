@@ -27,6 +27,7 @@ CREATE TEMP TABLE IF NOT EXISTS values_work (
   received_at INTEGER,
   bootstrap_metadata TEXT,
   only_if_updates INTEGER NOT NULL DEFAULT 0, -- 1: apply only if the payload says has_updates
+  stale INTEGER NOT NULL DEFAULT 0,  -- 1: for a user the session has left (never applied)
   -- The top-level fields values_apply reads, in one pass over the payload (each pass over a
   -- large payload costs milliseconds): time, has_updates, hash_used, derived_fields,
   -- full_checksum, param_stores, sdk_flags, sdk_configs, response_format.
@@ -42,7 +43,7 @@ CREATE TEMP TABLE IF NOT EXISTS values_work (
 -- VALUES: an INSERT ... SELECT into a table with triggers first copies its rows to a temporary
 -- table.)
 CREATE TEMP TRIGGER IF NOT EXISTS values_apply AFTER INSERT ON values_work
-WHEN NOT NEW.only_if_updates OR coalesce(NEW.header ->> 1, 0)
+WHEN NOT NEW.stale AND (NOT NEW.only_if_updates OR coalesce(NEW.header ->> 1, 0))
 BEGIN
   UPDATE session SET
     source = NEW.source,
@@ -62,7 +63,7 @@ END;
 -- v1 (the usual response): each entity object is stored as is.
 -- (One pass over the payload: the sections are read from its top-level members.)
 CREATE TEMP TRIGGER IF NOT EXISTS values_apply_v1 AFTER INSERT ON values_work
-WHEN (NOT NEW.only_if_updates OR coalesce(NEW.header ->> 1, 0))
+WHEN NOT NEW.stale AND (NOT NEW.only_if_updates OR coalesce(NEW.header ->> 1, 0))
   AND NEW.from_cache IS NULL AND NEW.header ->> 8 IS NOT 'init-v2'
 BEGIN
   DELETE FROM entity_body;
@@ -77,7 +78,8 @@ END;
 
 -- Values stored as applied.
 CREATE TEMP TRIGGER IF NOT EXISTS values_apply_cached AFTER INSERT ON values_work
-WHEN (NOT NEW.only_if_updates OR coalesce(NEW.header ->> 1, 0)) AND NEW.from_cache IS NOT NULL
+WHEN NOT NEW.stale AND (NOT NEW.only_if_updates OR coalesce(NEW.header ->> 1, 0))
+  AND NEW.from_cache IS NOT NULL
 BEGIN
   DELETE FROM entity_body;
   INSERT OR REPLACE INTO entity_body (kind, name, body)
@@ -85,7 +87,7 @@ BEGIN
 END;
 
 CREATE TEMP TRIGGER IF NOT EXISTS values_apply_v2 AFTER INSERT ON values_work
-WHEN (NOT NEW.only_if_updates OR coalesce(NEW.header ->> 1, 0))
+WHEN NOT NEW.stale AND (NOT NEW.only_if_updates OR coalesce(NEW.header ->> 1, 0))
   AND NEW.from_cache IS NULL AND NEW.header ->> 8 = 'init-v2'
 BEGIN
   DELETE FROM entity_body;
@@ -295,13 +297,15 @@ DELETE FROM values_work;
 -- @writes: values
 -- A successful initialize response for :user / :scoped_key (the session's user when the request
 -- was made). Ignored if the session has moved on to another user. Returns has_updates/applied.
--- The response is parsed once: values_work (present only if the session is still that user's)
--- carries has_updates for the later statements.
+-- The response is parsed once: values_work (kept only if the session is still that user's)
+-- carries has_updates for the later statements. (:payload is bound once: binding a 1 MB
+-- response costs about 2 ms per statement that names it.)
 INSERT INTO values_work
-    (payload, user_hash, source, set_received, received_at, bootstrap_metadata, only_if_updates)
-  SELECT :payload, s.user_hash, 'Network', 1, c.now_ms, NULL, 1
-  FROM session AS s, clock AS c
-  WHERE s.user = :user AND s.scoped_key = :scoped_key;
+    (payload, user_hash, source, set_received, received_at, bootstrap_metadata, only_if_updates,
+     stale)
+  VALUES (:payload, (SELECT user_hash FROM session), 'Network', 1, (SELECT now_ms FROM clock), NULL,
+    1, NOT EXISTS (SELECT 1 FROM session WHERE user = :user AND scoped_key = :scoped_key));
+DELETE FROM values_work WHERE stale;
 UPDATE session SET source = 'NetworkNotModified', received_at = (SELECT now_ms FROM clock)
   WHERE EXISTS (SELECT 1 FROM values_work WHERE NOT coalesce(header ->> 1, 0));
 -- Persist (as applied), remember which user the custom cache key points to, and keep the 10 most
@@ -331,8 +335,7 @@ DELETE FROM cached_values WHERE cache_key NOT IN (SELECT cache_key FROM cache_ke
 DELETE FROM sticky_value
   WHERE owner <> '' AND owner <> (SELECT cache_key FROM session)
     AND owner NOT IN (SELECT cache_key FROM cache_key_map);
-SELECT coalesce((SELECT header ->> 1 FROM values_work), json_extract(:payload, '$.has_updates'), 0)
-    AS has_updates,
+SELECT coalesce((SELECT header ->> 1 FROM values_work), 0) AS has_updates,
   EXISTS (SELECT 1 FROM values_work) AS applied;
 DELETE FROM values_work;
 
