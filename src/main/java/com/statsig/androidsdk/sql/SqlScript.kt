@@ -17,8 +17,9 @@ internal class SqlScript private constructor(val blocks: Map<String, Block>) {
      * `@reads: a, b` / `@writes: a, b` name the data it depends on / changes;
      * `@cache`: its result may be reused until a block writing what it reads runs (a result row
      * with `_cacheable` = 0 opts a single call out, and counts as a write);
-     * `@defer`: calls may be queued and run later, in order, in one transaction (row-returning
-     * statements then run once, after the last queued call; calls also get `:time`);
+     * `@defer`: calls may be queued and run later, in order, in one transaction: the first
+     * statement once per call, the others once after each run of consecutive calls of the block
+     * (calls also get `:time`);
      * `@coalesce`: queued calls with identical parameters may be merged (`repeat` counts them);
      * `@quiet: <ms>`: after a call that changed rows, identical calls made within <ms> change
      * nothing, as long as nothing the block reads is written in between (so they may be skipped).
@@ -49,7 +50,7 @@ internal class SqlScript private constructor(val blocks: Map<String, Block>) {
         private val BLOCK_HEADER = Regex("^-- name: (\\S+)\\s*$")
         private val DIRECTIVE = Regex("^-- @(\\w+)(?::\\s*(.*))?$")
         private val CREATE_TRIGGER = Regex("^CREATE\\s+(TEMP\\s+)?TRIGGER", RegexOption.IGNORE_CASE)
-        private val RETURNS_ROWS = Regex("^(SELECT|WITH|VALUES)\\b", RegexOption.IGNORE_CASE)
+        private val RETURNS_ROWS = Regex("^(SELECT|WITH|VALUES|PRAGMA)\\b", RegexOption.IGNORE_CASE)
 
         val default: SqlScript by lazy {
             parse(
@@ -122,7 +123,10 @@ internal class SqlScript private constructor(val blocks: Map<String, Block>) {
             )
         }
 
-        /** Replaces `:name` parameters (outside quotes and comments) with `?`. */
+        /**
+         * Replaces `:name` parameters (outside quotes and comments) with `?N`, N numbering the
+         * distinct names, so a parameter used several times is bound once.
+         */
         private fun compile(sql: String): Statement {
             val out = StringBuilder(sql.length)
             val params = ArrayList<String>()
@@ -150,8 +154,13 @@ internal class SqlScript private constructor(val blocks: Map<String, Block>) {
                             ) -> {
                         var j = i + 1
                         while (j < sql.length && (sql[j].isLetterOrDigit() || sql[j] == '_')) j++
-                        params.add(sql.substring(i + 1, j))
-                        out.append('?')
+                        val name = sql.substring(i + 1, j)
+                        var index = params.indexOf(name)
+                        if (index < 0) {
+                            params.add(name)
+                            index = params.size - 1
+                        }
+                        out.append('?').append(index + 1)
                         i = j
                     }
                     else -> {

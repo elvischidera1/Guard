@@ -22,7 +22,8 @@ class HashingTest {
     private fun inputs(): List<String> {
         val random = Random(42)
         val alphabet = "abcXYZ019 _-.:\"'\\/é漢😀\u007f"
-        return listOf("", "a", "a".repeat(55), "a".repeat(56), "a".repeat(64), "a".repeat(200)) +
+        return listOf("", "a", "a".repeat(55), "a".repeat(56), "a".repeat(64), "a".repeat(200),
+            "b".repeat(512), "b".repeat(513), "é".repeat(700)) +
             (1..60).map { n ->
                 // whole code points (a lone surrogate is not a valid string anywhere)
                 val codePoints = alphabet.codePoints().toArray()
@@ -52,5 +53,23 @@ class HashingTest {
         db.run("trim_hash_memo")
         assertEquals(2048L, db.scalar("SELECT count(*) FROM hash_memo"))
         assertEquals(djb2("n2999"), db.scalar("SELECT output FROM hash_memo WHERE input = 'n2999'"))
+    }
+
+    @Test
+    fun get_value_finds_djb2_hashed_names_of_any_length_and_alphabet() {
+        val db = newDb()
+        db.startSession()
+        val names = inputs().filter { it.isNotEmpty() }.distinct()
+        val gates = names.joinToString(",") { name ->
+            val hash = djb2(name)
+            "\"$hash\":{\"name\":\"$hash\",\"value\":true,\"rule_id\":\"r\"}"
+        }
+        db.run("save_values", mapOf(
+            "payload" to """{"feature_gates":{$gates},"dynamic_configs":{},"layer_configs":{},"has_updates":true,"time":1,"hash_used":"djb2"}""",
+            "user" to """{"userID":"u1"}""", "scoped_key" to "u1:client-key"))
+        for (name in names) {
+            assertEquals(name, 1L, db.one("get_value", mapOf("kind" to "gate", "name" to name))!!["found"])
+        }
+        assertEquals(0L, db.one("get_value", mapOf("kind" to "gate", "name" to "not a gate"))!!["found"])
     }
 }

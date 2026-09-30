@@ -27,10 +27,27 @@ internal class StatsigDb(
         private val hash = (block.hashCode() * 31 + params.hashCode()) * 31 + tag.hashCode()
         override fun hashCode() = hash
         override fun equals(other: Any?) = other is Key && other.hash == hash &&
-            other.block == block && other.tag == tag && other.params == params
+            other.block == block && other.tag == tag &&
+            (other.params === params || other.params == params)
     }
 
-    private class Deferred(val block: SqlScript.Block, val params: MutableMap<String, Any?>)
+    /**
+     * Parameters that are passed many times: the map's hash is computed once (maps are hashed
+     * and compared for the cache, coalescing and @quiet).
+     */
+    class Params(private val map: Map<String, Any?>) : Map<String, Any?> by map {
+        private val hash = map.hashCode()
+        override fun hashCode() = hash
+        override fun equals(other: Any?) = other === this || map == other
+        override fun toString() = map.toString()
+    }
+
+    /** A queued call: its parameters (plus time/repeat), and its key if coalesced or quiet. */
+    private class Deferred(
+        val block: SqlScript.Block,
+        val key: Key?,
+        val params: MutableMap<String, Any?>
+    )
 
     /** Cached for a `@quiet` block: identical calls before [until] change nothing. */
     private class Quiet(val until: Long)
@@ -143,7 +160,7 @@ internal class StatsigDb(
                 call.putAll(params)
                 call["time"] = System.currentTimeMillis()
                 call["repeat"] = 1
-                val entry = Deferred(block, call)
+                val entry = Deferred(block, key, call)
                 deferred.add(entry)
                 if (block.coalesce) coalesced[key!!] = entry
             }
@@ -159,64 +176,51 @@ internal class StatsigDb(
     }
 
     /**
-     * Runs the queued calls in order, in one transaction. The row-returning statements of a block
-     * run once, after its last queued call. Returns whether any reported `should_flush`.
-     * A failing call does not stop the others (SQLite undoes just the failed statement); the
-     * first failure is rethrown once the rest are committed.
+     * Runs the queued calls in order, in one transaction: a block's first statement once per call,
+     * its other statements once after each run of consecutive calls of the block (with the last
+     * call's parameters). Returns whether any reported `should_flush`. A failing call does not
+     * stop the others (SQLite undoes just the failed statement); the first failure is rethrown
+     * once the rest are committed.
      */
     private fun drain(): Boolean {
         val calls = ArrayList(deferred)
         deferred.clear()
         coalesced.clear()
-        val last = HashMap<SqlScript.Block, Deferred>()
         val quiet = ArrayList<Deferred>()
         var failure: Throwable? = null
+        var flush = false
         driver.beginTransaction()
         try {
-            for (call in calls) {
+            for ((i, call) in calls.withIndex()) {
+                val statements = call.block.statements
                 try {
-                    var changed = 0
-                    for (statement in call.block.statements) {
-                        if (!statement.returnsRows) changed += update(statement, call.params)
-                    }
+                    val changed = update(statements[0], call.params)
                     if (changed > 0 && call.block.quietMs != null) quiet.add(call)
                 } catch (e: Exception) {
                     if (failure == null) failure = e
                 }
-                last[call.block] = call
-            }
-            var flush = false
-            for ((block, call) in last) {
-                for (statement in block.statements) {
-                    if (statement.returnsRows &&
-                        exec(statement, call.params)?.firstOrNull()?.get("should_flush") == 1L
-                    ) {
-                        flush = true
+                if (i + 1 < calls.size && calls[i + 1].block === call.block) continue
+                for (statement in statements.subList(1, statements.size)) {
+                    if (statement.returnsRows) {
+                        val row = exec(statement, call.params)?.firstOrNull()
+                        if (row?.get("should_flush") == 1L) flush = true
+                    } else {
+                        update(statement, call.params)
                     }
                 }
             }
             driver.commit()
-            for (block in last.keys) invalidate(block.writes)
-            for (call in quiet) {
-                val block = call.block
-                val params = call.params.filterKeys { it != "time" && it != "repeat" }
-                val until = Quiet(call.params["time"] as Long + block.quietMs!!)
-                for (domain in block.reads) {
-                    put(
-                        domain,
-                        Key(block.name, params, Quiet::class.java),
-                        until
-                    )
-                }
-            }
-            failure?.let { throw it }
-            return flush
         } catch (e: Throwable) {
-            if (e !== failure) {
-                runCatching { driver.rollback() }.exceptionOrNull()?.let { e.addSuppressed(it) }
-            }
+            runCatching { driver.rollback() }.exceptionOrNull()?.let { e.addSuppressed(it) }
             throw e
         }
+        for (block in calls.mapTo(HashSet()) { it.block }) invalidate(block.writes)
+        for (call in quiet) {
+            val until = Quiet(call.params["time"] as Long + call.block.quietMs!!)
+            for (domain in call.block.reads) put(domain, call.key!!, until)
+        }
+        failure?.let { throw it }
+        return flush
     }
 
     private fun put(domain: String, key: Key, value: Any) {

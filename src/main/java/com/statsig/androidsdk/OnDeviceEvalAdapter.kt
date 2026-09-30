@@ -114,6 +114,7 @@ class OnDeviceEvalAdapter(data: String?) {
 
     fun getParamStore(client: StatsigClient, current: ParameterStore): ParameterStore? {
         val db = db ?: return null
+        specsTime ?: return null
         val row = db.one("dcs_param_store", mapOf("name" to current.name)) ?: return null
         if (row.long("time")!! <= (current.getEvalDetails().lcut ?: 0)) return null
         val parameters = row.string("parameters")

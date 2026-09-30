@@ -17,97 +17,86 @@ CREATE TEMP TABLE IF NOT EXISTS values_work (
   source TEXT NOT NULL,              -- EvalSource to report from now on
   set_received INTEGER NOT NULL,     -- 1: replace session.received_at with received_at
   received_at INTEGER,
-  bootstrap_metadata TEXT
+  bootstrap_metadata TEXT,
+  only_if_updates INTEGER NOT NULL DEFAULT 0, -- 1: apply only if the payload says has_updates
+  -- The top-level fields values_apply reads, in one pass over the payload (each pass over a
+  -- large payload costs milliseconds): time, has_updates, hash_used, derived_fields,
+  -- full_checksum, param_stores, sdk_flags, sdk_configs, response_format.
+  header TEXT GENERATED ALWAYS AS (json_extract(payload, '$.time', '$.has_updates', '$.hash_used',
+    '$.derived_fields', '$.full_checksum', '$.param_stores', '$.sdk_flags', '$.sdk_configs',
+    '$.response_format')) STORED
 );
 
--- Replaces the values in use: header fields on `session`, rows in `entity`.
+-- Replaces the values in use: header fields on `session`, rows in `entity`. The values_work row
+-- stays until the block that inserted it deletes it.
 CREATE TEMP TRIGGER IF NOT EXISTS values_apply AFTER INSERT ON values_work
+WHEN NOT NEW.only_if_updates OR coalesce(NEW.header ->> 1, 0)
 BEGIN
   UPDATE session SET
     source = NEW.source,
     received_at = CASE WHEN NEW.set_received THEN NEW.received_at ELSE received_at END,
     values_user_hash = NEW.user_hash,
-    lcut = coalesce(json_extract(NEW.payload, '$.time'), 0),
-    has_updates = coalesce(json_extract(NEW.payload, '$.has_updates'), 0),
-    hash_used = json_extract(NEW.payload, '$.hash_used'),
-    derived_fields = json_extract(NEW.payload, '$.derived_fields'),
-    full_checksum = json_extract(NEW.payload, '$.full_checksum'),
-    param_stores = json_extract(NEW.payload, '$.param_stores'),
-    sdk_flags = json_extract(NEW.payload, '$.sdk_flags'),
-    sdk_configs = json_extract(NEW.payload, '$.sdk_configs'),
+    lcut = coalesce(NEW.header ->> 0, 0),
+    has_updates = coalesce(NEW.header ->> 1, 0),
+    hash_used = NEW.header ->> 2,
+    derived_fields = NEW.header ->> 3,
+    full_checksum = NEW.header ->> 4,
+    param_stores = NEW.header ->> 5,
+    sdk_flags = NEW.header ->> 6,
+    sdk_configs = NEW.header ->> 7,
     bootstrap_metadata = NEW.bootstrap_metadata;
 
-  DELETE FROM entity;
+  DELETE FROM entity_body;
 
-  -- v1 (the usual response): fields are read from each entity object.
-  INSERT OR REPLACE INTO entity (kind, name, value, rule_id, group_name, id_type, secondary_exposures,
-      undelegated_secondary_exposures, is_user_in_experiment, is_experiment_active, is_device_based,
-      allocated_experiment_name, explicit_parameters, passed, parameter_rule_ids)
-    SELECT k.kind, e.key,
-      CASE WHEN k.kind = 'gate' THEN CASE WHEN json_extract(e.value, '$.value') THEN 'true' ELSE 'false' END
-        ELSE e.value -> '$.value' END,
-      json_extract(e.value, '$.rule_id'),
-      json_extract(e.value, '$.group_name'),
-      json_extract(e.value, '$.id_type'),
-      e.value -> '$.secondary_exposures',
-      e.value -> '$.undelegated_secondary_exposures',
-      coalesce(json_extract(e.value, '$.is_user_in_experiment'), 0),
-      coalesce(json_extract(e.value, '$.is_experiment_active'), 0),
-      coalesce(json_extract(e.value, '$.is_device_based'), 0),
-      json_extract(e.value, '$.allocated_experiment_name'),
-      e.value -> '$.explicit_parameters',
-      json_extract(e.value, '$.passed'),
-      e.value -> '$.parameter_rule_ids'
-    FROM (SELECT 'gate' AS kind, '$.feature_gates' AS path
-          UNION ALL SELECT 'config', '$.dynamic_configs'
-          UNION ALL SELECT 'layer', '$.layer_configs') AS k,
-      json_each(NEW.payload, k.path) AS e
-    WHERE e.type = 'object' AND json_extract(NEW.payload, '$.response_format') IS NOT 'init-v2';
-
-  INSERT OR REPLACE INTO entity (kind, name, value)
-    SELECT 'param_store', key, value FROM json_each(NEW.payload, '$.param_stores') WHERE type = 'object';
+  -- v1 (the usual response): each entity object is stored as is.
+  -- (One pass over the payload: the sections are read from its top-level members.)
+  INSERT OR REPLACE INTO entity_body (kind, name, body)
+    SELECT CASE s.key WHEN 'feature_gates' THEN 'gate' WHEN 'dynamic_configs' THEN 'config'
+        WHEN 'layer_configs' THEN 'layer' ELSE 'param_store' END,
+      e.key, e.value
+    FROM json_each(NEW.payload) AS s, json_each(s.value) AS e
+    WHERE s.type = 'object' AND e.type = 'object'
+      AND (s.key = 'param_stores' OR (s.key IN ('feature_gates', 'dynamic_configs', 'layer_configs')
+        AND NEW.header ->> 8 IS NOT 'init-v2'));
 
   -- init-v2 (compact bootstrap format): short keys; values and exposures are shared through
-  -- lookup tables referenced by id (read once into v2_value / v2_exposure).
+  -- lookup tables referenced by id (read once into v2_value / v2_exposure). For other formats
+  -- json_each gets NULL, so the payload is not read again.
   DELETE FROM v2_value;
   DELETE FROM v2_exposure;
   INSERT OR REPLACE INTO v2_value (id, value)
-    SELECT key, value FROM json_each(NEW.payload, '$.values')
-    WHERE json_extract(NEW.payload, '$.response_format') = 'init-v2';
+    SELECT key, value
+    FROM json_each(CASE WHEN NEW.header ->> 8 = 'init-v2' THEN NEW.payload END, '$.values');
   INSERT OR REPLACE INTO v2_exposure (id, value)
-    SELECT key, value FROM json_each(NEW.payload, '$.exposures')
-    WHERE json_extract(NEW.payload, '$.response_format') = 'init-v2';
-  INSERT OR REPLACE INTO entity (kind, name, value, rule_id, group_name, id_type, secondary_exposures,
-      undelegated_secondary_exposures, is_user_in_experiment, is_experiment_active, is_device_based,
-      allocated_experiment_name, explicit_parameters, passed, parameter_rule_ids)
-    SELECT k.kind, e.key,
-      CASE WHEN k.kind = 'gate' THEN CASE WHEN json_extract(e.value, '$.v') THEN 'true' ELSE 'false' END
-        ELSE coalesce((SELECT value FROM v2_value WHERE id = CAST(json_extract(e.value, '$.v') AS TEXT)), '{}') END,
-      coalesce(json_extract(e.value, '$.r'), 'default'),
-      json_extract(e.value, '$.gn'),
-      json_extract(e.value, '$.i'),
-      (SELECT json_group_array(json(value)) FROM (
+    SELECT key, value
+    FROM json_each(CASE WHEN NEW.header ->> 8 = 'init-v2' THEN NEW.payload END, '$.exposures');
+  INSERT OR REPLACE INTO entity_body (kind, name, body)
+    SELECT k.kind, e.key, json_object(
+      'value', CASE WHEN k.kind = 'gate' THEN json(CASE WHEN json_extract(e.value, '$.v') THEN 'true' ELSE 'false' END)
+        ELSE json(coalesce((SELECT value FROM v2_value WHERE id = CAST(json_extract(e.value, '$.v') AS TEXT)), '{}')) END,
+      'rule_id', coalesce(json_extract(e.value, '$.r'), 'default'),
+      'group_name', json_extract(e.value, '$.gn'),
+      'id_type', json_extract(e.value, '$.i'),
+      'secondary_exposures', (SELECT json_group_array(json(value)) FROM (
          SELECT x.value FROM json_each(e.value, '$.s') AS i JOIN v2_exposure AS x ON x.id = CAST(i.value AS TEXT)
          ORDER BY i.key)),
-      (SELECT json_group_array(json(value)) FROM (
+      'undelegated_secondary_exposures', (SELECT json_group_array(json(value)) FROM (
          SELECT x.value FROM json_each(e.value, '$.us') AS i JOIN v2_exposure AS x ON x.id = CAST(i.value AS TEXT)
          ORDER BY i.key)),
-      coalesce(json_extract(e.value, '$.ue'), 0),
-      coalesce(json_extract(e.value, '$.ea'), 0),
-      coalesce(json_extract(e.value, '$.d'), 0),
-      json_extract(e.value, '$.ae'),
-      coalesce(e.value -> '$.ep', '[]'),
-      json_extract(e.value, '$.p'),
-      e.value -> '$.pr'
+      'is_user_in_experiment', e.value -> '$.ue',
+      'is_experiment_active', e.value -> '$.ea',
+      'is_device_based', e.value -> '$.d',
+      'allocated_experiment_name', json_extract(e.value, '$.ae'),
+      'explicit_parameters', json(coalesce(e.value -> '$.ep', '[]')),
+      'passed', e.value -> '$.p',
+      'parameter_rule_ids', e.value -> '$.pr')
     FROM (SELECT 'gate' AS kind, '$.feature_gates' AS path
           UNION ALL SELECT 'config', '$.dynamic_configs'
           UNION ALL SELECT 'layer', '$.layer_configs') AS k,
-      json_each(NEW.payload, k.path) AS e
-    WHERE e.type = 'object' AND json_extract(NEW.payload, '$.response_format') = 'init-v2';
+      json_each(CASE WHEN NEW.header ->> 8 = 'init-v2' THEN NEW.payload END, k.path) AS e
+    WHERE e.type = 'object';
   DELETE FROM v2_value;
   DELETE FROM v2_exposure;
-
-  DELETE FROM values_work;
 END;
 
 -- An entity as JSON (the v1 response shape), for sticky values and getInitializeResponseJson.
@@ -192,7 +181,7 @@ FROM session;
 -- @writes: values, events
 -- Starts a client session for :user (evaluation copy, JSON). Clears all per-client state.
 DELETE FROM session;
-DELETE FROM entity;
+DELETE FROM entity_body;
 DELETE FROM memory_values;
 DELETE FROM lookup;
 DELETE FROM event_queue;
@@ -201,8 +190,8 @@ DELETE FROM non_exposed;
 DELETE FROM marker;
 DELETE FROM override;
 INSERT INTO override (kind, name, value) SELECT kind, name, value FROM local_override;
-INSERT INTO hash_input (algo, input)
-  SELECT 'djb2', :user
+INSERT INTO djb2_input (input)
+  SELECT :user
   WHERE NOT EXISTS (SELECT 1 FROM hash_memo WHERE algo = 'djb2' AND input = :user);
 INSERT INTO session (id, sdk_key, user, first_user, user_hash, scoped_key, cache_key, source, options)
   SELECT 1, :sdk_key, :user, :user, output, :scoped_key, output || ':' || :sdk_key, 'Uninitialized', :options
@@ -224,8 +213,8 @@ SELECT value AS stable_id FROM setting WHERE key = 'stable_id';
 -- @writes: values, events
 -- updateUser: switch the session to another user. Values stay until load_cache replaces them.
 DELETE FROM hash_memo WHERE rowid <= (SELECT max(rowid) FROM hash_memo) - 2048;
-INSERT INTO hash_input (algo, input)
-  SELECT 'djb2', :user
+INSERT INTO djb2_input (input)
+  SELECT :user
   WHERE NOT EXISTS (SELECT 1 FROM hash_memo WHERE algo = 'djb2' AND input = :user);
 UPDATE session SET
   user = :user,
@@ -266,28 +255,32 @@ INSERT INTO values_work (payload, user_hash, source, set_received, received_at, 
       WHERE k.scoped_key = s.scoped_key AND v.cache_key = k.cache_key
       ORDER BY priority LIMIT 1
     ) AS found;
+DELETE FROM values_work;
 
 
 -- name: save_values
 -- @writes: values
 -- A successful initialize response for :user / :scoped_key (the session's user when the request
 -- was made). Ignored if the session has moved on to another user. Returns has_updates/applied.
-INSERT INTO values_work (payload, user_hash, source, set_received, received_at, bootstrap_metadata)
-  SELECT :payload, s.user_hash, 'Network', 1, c.now_ms, NULL
+-- The response is parsed once: values_work (present only if the session is still that user's)
+-- carries has_updates for the later statements.
+INSERT INTO values_work
+    (payload, user_hash, source, set_received, received_at, bootstrap_metadata, only_if_updates)
+  SELECT :payload, s.user_hash, 'Network', 1, c.now_ms, NULL, 1
   FROM session AS s, clock AS c
-  WHERE s.user = :user AND s.scoped_key = :scoped_key AND json_extract(:payload, '$.has_updates');
+  WHERE s.user = :user AND s.scoped_key = :scoped_key;
 UPDATE session SET source = 'NetworkNotModified', received_at = (SELECT now_ms FROM clock)
-  WHERE user = :user AND scoped_key = :scoped_key AND NOT coalesce(json_extract(:payload, '$.has_updates'), 0);
+  WHERE EXISTS (SELECT 1 FROM values_work WHERE NOT coalesce(header ->> 1, 0));
 -- Persist, remember which user the custom cache key points to, and keep the 10 most recent.
 INSERT OR REPLACE INTO cached_values (cache_key, user_hash, payload, received_at)
-  SELECT s.cache_key, s.user_hash, :payload, s.received_at FROM session AS s
-  WHERE s.user = :user AND s.scoped_key = :scoped_key AND json_extract(:payload, '$.has_updates');
+  SELECT s.cache_key, s.user_hash, w.payload, s.received_at FROM session AS s, values_work AS w
+  WHERE w.header ->> 1;
 DELETE FROM memory_values
-  WHERE cache_key = (SELECT cache_key FROM session WHERE user = :user AND scoped_key = :scoped_key)
-    AND json_extract(:payload, '$.has_updates');
+  WHERE cache_key = (SELECT cache_key FROM session)
+    AND EXISTS (SELECT 1 FROM values_work WHERE header ->> 1);
 INSERT OR REPLACE INTO cache_key_map (scoped_key, cache_key, last_used_at)
-  SELECT s.scoped_key, s.cache_key, c.now_ms FROM session AS s, clock AS c
-  WHERE s.user = :user AND s.scoped_key = :scoped_key AND json_extract(:payload, '$.has_updates');
+  SELECT s.scoped_key, s.cache_key, c.now_ms FROM session AS s, clock AS c, values_work AS w
+  WHERE w.header ->> 1;
 DELETE FROM cache_key_map WHERE scoped_key IN (
   SELECT scoped_key FROM cache_key_map WHERE scoped_key <> :scoped_key
   ORDER BY last_used_at, scoped_key
@@ -296,8 +289,10 @@ DELETE FROM cached_values WHERE cache_key NOT IN (SELECT cache_key FROM cache_ke
 DELETE FROM sticky_value
   WHERE owner <> '' AND owner <> (SELECT cache_key FROM session)
     AND owner NOT IN (SELECT cache_key FROM cache_key_map);
-SELECT coalesce(json_extract(:payload, '$.has_updates'), 0) AS has_updates,
-  EXISTS (SELECT 1 FROM session WHERE user = :user AND scoped_key = :scoped_key) AS applied;
+SELECT coalesce((SELECT header ->> 1 FROM values_work), json_extract(:payload, '$.has_updates'), 0)
+    AS has_updates,
+  EXISTS (SELECT 1 FROM values_work) AS applied;
+DELETE FROM values_work;
 
 
 -- name: network_failed
@@ -348,6 +343,7 @@ INSERT INTO values_work (payload, user_hash, source, set_received, received_at, 
         'customIDs', json(json_extract(:values, '$.user.customIDs')),
         'statsigEnvironment', json(json_extract(:values, '$.user.statsigEnvironment')))) END)), '{}')
   FROM session AS s;
+DELETE FROM values_work;
 DELETE FROM bootstrap_user_ids;
 DELETE FROM bootstrap_evaluated_ids;
 INSERT OR REPLACE INTO memory_values (cache_key, scoped_key, payload, bootstrap_metadata)
@@ -387,14 +383,23 @@ FROM session;
 -- @cache
 -- @reads: values
 -- checkGate / getConfig / getParameterStore (:kind 'gate' | 'config' | 'param_store'): the local
--- override, else the served entity (by name, then by hashed name). Same columns as lookup_result.
+-- override, else the served entity (by name, then by hashed name). The columns of lookup_result
+-- that gates, configs and parameter stores use (every returned column costs the host a read).
+-- :name's djb2 is computed inline (see djb2_output) and other hashes through hash_memo: only
+-- sha256, and djb2 of names the inline form cannot take (over 512 characters or with characters
+-- outside the BMP), go through hash_input.
 INSERT INTO hash_input (algo, input)
-  SELECT algo, :name FROM name_hash_algo
-  WHERE algo IS NOT NULL
+  SELECT a.algo, :name FROM name_hash_algo AS a
+  WHERE (a.algo = 'sha256' OR (a.algo = 'djb2' AND (length(:name) > 512
+           OR :name GLOB '*[' || char(65536) || '-' || char(1114111) || ']*')))
     AND NOT EXISTS (SELECT 1 FROM entity WHERE kind = :kind AND name = :name)
-    AND NOT EXISTS (SELECT 1 FROM hash_memo AS m WHERE m.algo = name_hash_algo.algo AND m.input = :name);
+    AND NOT EXISTS (SELECT 1 FROM hash_memo AS m WHERE m.algo = a.algo AND m.input = :name);
+WITH d(h) AS (
+  SELECT CASE WHEN count(*) = length(:name) AND max(c) <= 65535
+    THEN CAST(sum(c * p) & 4294967295 AS TEXT) END
+  FROM (SELECT unicode(substr(:name, length(:name) - k, 1)) AS c, p
+        FROM djb2_pow WHERE k < length(:name)))
 SELECT
-  :kind AS kind,
   :name AS name,
   o.value IS NOT NULL AS overridden,
   o.value IS NULL AND e.name IS NOT NULL AS found,
@@ -403,14 +408,11 @@ SELECT
   CASE WHEN o.value IS NULL THEN e.group_name END AS group_name,
   CASE WHEN o.value IS NULL THEN e.id_type END AS id_type,
   CASE WHEN o.value IS NULL THEN e.secondary_exposures END AS secondary_exposures,
-  CASE WHEN o.value IS NULL THEN e.undelegated_secondary_exposures END AS undelegated_secondary_exposures,
   CASE WHEN o.value IS NULL THEN coalesce(e.is_user_in_experiment, 0) ELSE 0 END AS is_user_in_experiment,
   CASE WHEN o.value IS NULL THEN coalesce(e.is_experiment_active, 0) ELSE 0 END AS is_experiment_active,
   CASE WHEN o.value IS NULL THEN coalesce(e.is_device_based, 0) ELSE 0 END AS is_device_based,
   CASE WHEN o.value IS NULL THEN e.allocated_experiment_name END AS allocated_experiment_name,
-  CASE WHEN o.value IS NULL THEN e.explicit_parameters END AS explicit_parameters,
   CASE WHEN o.value IS NULL THEN e.passed END AS rule_passed,
-  CASE WHEN o.value IS NULL THEN e.parameter_rule_ids END AS parameter_rule_ids,
   s.source,
   CASE WHEN o.value IS NOT NULL THEN 'LocalOverride' WHEN e.name IS NOT NULL THEN 'Recognized' ELSE 'Unrecognized' END AS reason,
   s.lcut,
@@ -420,6 +422,7 @@ FROM session AS s
   LEFT JOIN override AS o ON o.kind = :kind AND o.name = :name
   LEFT JOIN entity AS e ON e.kind = :kind AND e.name = coalesce(
     (SELECT name FROM entity WHERE kind = :kind AND name = :name),
+    CASE WHEN a.algo = 'djb2' THEN (SELECT h FROM d) END,
     (SELECT output FROM hash_memo AS m WHERE m.algo = a.algo AND m.input = :name));
 
 

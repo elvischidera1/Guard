@@ -18,9 +18,13 @@
 --           connection, so TEMP tables give every client its own session for free.
 
 -- name: connect
+-- Run once per connection, outside any transaction (PRAGMAs run as queries: some return a row).
 -- Per-client state is scratch data: keep TEMP tables in memory (the default is a temp file).
--- Run once per connection, outside any transaction.
 PRAGMA temp_store = MEMORY;
+-- Durable state is a cache: write-ahead logging without a sync per commit (Android's own setting
+-- for WAL databases). A crash can lose the last writes, never corrupt the file.
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
 
 -- name: schema
 
@@ -93,6 +97,7 @@ CREATE TEMP TABLE IF NOT EXISTS session (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   sdk_key TEXT NOT NULL,
   user TEXT NOT NULL,                -- evaluation copy of the user, JSON
+  logging_user TEXT GENERATED ALWAYS AS (json_remove(user, '$.privateAttributes')) STORED,
   first_user TEXT NOT NULL,          -- user the client started with (diagnostics events)
   user_hash TEXT NOT NULL,
   scoped_key TEXT NOT NULL,
@@ -114,26 +119,37 @@ CREATE TEMP TABLE IF NOT EXISTS session (
 );
 
 -- Gates, configs, layers and parameter stores of the values in use, keyed as served (the server
--- usually sends djb2-hashed names). Fields are extracted once, when values are applied, so that
--- lookups never parse JSON. Columns holding JSON say so.
-CREATE TEMP TABLE IF NOT EXISTS entity (
+-- usually sends djb2-hashed names). Applying values only stores each entity's JSON (body, in the
+-- v1 response shape); the `entity` view computes the fields when read, so values with thousands
+-- of entities apply quickly while lookups (whose results the host caches) pay for the few rows
+-- they read.
+CREATE TEMP TABLE IF NOT EXISTS entity_body (
   kind TEXT NOT NULL,                -- 'gate' | 'config' | 'layer' | 'param_store'
   name TEXT NOT NULL,
-  value TEXT,                        -- JSON: true/false for gates, an object otherwise
-  rule_id TEXT,
-  group_name TEXT,
-  id_type TEXT,
-  secondary_exposures TEXT,          -- JSON array
-  undelegated_secondary_exposures TEXT, -- JSON array
-  is_user_in_experiment INTEGER NOT NULL DEFAULT 0,
-  is_experiment_active INTEGER NOT NULL DEFAULT 0,
-  is_device_based INTEGER NOT NULL DEFAULT 0,
-  allocated_experiment_name TEXT,
-  explicit_parameters TEXT,          -- JSON array
-  passed INTEGER,                    -- NULL when not served
-  parameter_rule_ids TEXT,           -- JSON object
+  body TEXT NOT NULL,                -- JSON object
   PRIMARY KEY (kind, name)
-) WITHOUT ROWID;
+);
+
+-- Columns holding JSON say so.
+CREATE TEMP VIEW IF NOT EXISTS entity AS
+SELECT kind, name, body,
+  CASE kind                                                -- JSON: true/false for gates, else an object
+    WHEN 'gate' THEN CASE WHEN json_extract(body, '$.value') THEN 'true' ELSE 'false' END
+    WHEN 'param_store' THEN body
+    ELSE body -> '$.value' END AS value,
+  json_extract(body, '$.rule_id') AS rule_id,
+  json_extract(body, '$.group_name') AS group_name,
+  json_extract(body, '$.id_type') AS id_type,
+  body -> '$.secondary_exposures' AS secondary_exposures,                          -- JSON array
+  body -> '$.undelegated_secondary_exposures' AS undelegated_secondary_exposures,  -- JSON array
+  coalesce(json_extract(body, '$.is_user_in_experiment'), 0) AS is_user_in_experiment,
+  coalesce(json_extract(body, '$.is_experiment_active'), 0) AS is_experiment_active,
+  coalesce(json_extract(body, '$.is_device_based'), 0) AS is_device_based,
+  json_extract(body, '$.allocated_experiment_name') AS allocated_experiment_name,
+  body -> '$.explicit_parameters' AS explicit_parameters,                          -- JSON array
+  json_extract(body, '$.passed') AS passed,                                        -- NULL: not served
+  body -> '$.parameter_rule_ids' AS parameter_rule_ids                             -- JSON object
+FROM entity_body;
 
 -- This client's copy of the overrides (kept in sync with local_override, which persists them).
 CREATE TEMP TABLE IF NOT EXISTS override (

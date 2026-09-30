@@ -29,6 +29,8 @@ FROM session;
 
 
 -- name: should_compress
+-- @cache
+-- @reads: values
 -- Whether a log_event request to :url is gzipped: always for Statsig's own host, and for the
 -- app's custom/fallback urls only when the served sdk flag enable_log_event_compression is on.
 SELECT CASE
@@ -41,20 +43,26 @@ SELECT CASE
 
 
 -- name: fallback_url
+-- @cache
+-- @reads: network
+-- @writes: network
 -- The fallback url to use for :endpoint, if one is known and still valid. Entries expire after
 -- 7 days, and are dropped when the app configured fallback urls that no longer include them.
--- Apps with a custom api and no fallback urls never use fallbacks.
+-- Apps with a custom api and no fallback urls never use fallbacks. Only "none" is cached: a url
+-- can expire.
 DELETE FROM fallback_url
   WHERE endpoint = :endpoint
     AND NOT (:fallback_urls IS NULL AND :has_custom_url)
     AND (expires_at < (SELECT now_ms FROM clock)
       OR (:fallback_urls IS NOT NULL AND NOT EXISTS (
         SELECT 1 FROM json_each(:fallback_urls) WHERE rtrim(value, '/') = rtrim(fallback_url.url, '/'))));
-SELECT url FROM fallback_url
+SELECT url, 0 AS _cacheable FROM fallback_url
   WHERE endpoint = :endpoint AND NOT (:fallback_urls IS NULL AND :has_custom_url);
 
 
 -- name: fallback_url_worked
+-- @writes: network
+-- A request to :endpoint's fallback url succeeded: keep it for another 7 days.
 UPDATE fallback_url SET expires_at = (SELECT now_ms FROM clock) + 604800000 WHERE endpoint = :endpoint;
 
 
@@ -78,6 +86,7 @@ FROM (
 
 
 -- name: fallback_url_pick
+-- @writes: network
 -- After a domain failure: switch :endpoint to the first candidate that is neither the current
 -- fallback nor one tried before. Returns 1 if a new url was stored.
 INSERT OR REPLACE INTO fallback_url (endpoint, url, previous, expires_at)

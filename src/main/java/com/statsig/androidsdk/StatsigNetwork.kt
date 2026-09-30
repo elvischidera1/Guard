@@ -306,9 +306,7 @@ internal class StatsigNetwork(
                         hasNetwork = connectivity.isNetworkAvailable()
                     )
                 }
-                if (response.code in
-                    200..299
-                ) {
+                if (fallback != null && response.code in 200..299) {
                     db.run("fallback_url_worked", mapOf("endpoint" to endpoint))
                 }
                 HttpResult(response.code, text)

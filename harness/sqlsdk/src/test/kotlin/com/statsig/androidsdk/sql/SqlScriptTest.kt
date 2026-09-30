@@ -16,7 +16,7 @@ class SqlScriptTest {
                 -- @cache
                 -- @reads: values, events
                 -- leading comment
-                SELECT ':not_a_param', "col:x", :a || ':' || :b -- trailing :comment
+                SELECT ':not_a_param', "col:x", :a || ':' || :b || :a -- trailing :comment
                 FROM t;
                 INSERT INTO t VALUES (:a);
 
@@ -38,6 +38,7 @@ class SqlScriptTest {
         assertEquals(listOf("a", "b"), one[0].params)
         assertTrue(one[0].returnsRows)
         assertTrue(one[0].sql.contains("':not_a_param'"))
+        assertTrue(one[0].sql.contains("?1 || ':' || ?2 || ?1")) // bound once per name
         assertFalse(one[0].sql.contains("comment"))
         assertFalse(one[1].returnsRows)
         val two = script.block("two").statements
@@ -49,8 +50,10 @@ class SqlScriptTest {
     @Test
     fun every_shipped_block_prepares() {
         // Parsing plus running the schema proves every statement in the schema compiles; the
-        // other blocks are prepared here against that schema.
+        // other blocks are prepared here against that schema (plus the evaluator's tables, which
+        // the first dcs_load creates).
         val db = newDb()
+        db.run("dcs_load", mapOf("payload" to "not json", "received_at" to 0L))
         val driver = StatsigDb::class.java.getDeclaredField("driver").apply { isAccessible = true }.get(db) as JdbcSqlDriver
         val prepare = JdbcSqlDriver::class.java.getDeclaredField("connection").apply { isAccessible = true }.get(driver) as java.sql.Connection
         for ((name, block) in SqlScript.default.blocks) {

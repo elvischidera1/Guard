@@ -660,15 +660,18 @@ class StatsigClient : LifecycleEventListener {
 
     private fun gateExposure(gate: FeatureGate, isManual: Boolean): Map<String, Any?> {
         val details = gate.getEvalDetails()
-        return mapOf(
-            "name" to gate.getName(),
-            "value" to gate.getValue(),
-            "rule_id" to gate.getRuleID(),
-            "secondary" to (gate.secondaryExposuresJson ?: toJson(gate.getSecondaryExposures())),
-            "reason" to details.getDetailedReasonString(),
-            "lcut" to details.lcut,
-            "received_at" to details.receivedAt,
-            "manual" to isManual
+        return StatsigDb.Params(
+            mapOf(
+                "name" to gate.getName(),
+                "value" to gate.getValue(),
+                "rule_id" to gate.getRuleID(),
+                "secondary" to
+                    (gate.secondaryExposuresJson ?: toJson(gate.getSecondaryExposures())),
+                "reason" to details.getDetailedReasonString(),
+                "lcut" to details.lcut,
+                "received_at" to details.receivedAt,
+                "manual" to isManual
+            )
         )
     }
 
@@ -685,16 +688,18 @@ class StatsigClient : LifecycleEventListener {
 
     private fun configExposure(config: DynamicConfig, isManual: Boolean): Map<String, Any?> {
         val details = config.getEvalDetails()
-        return mapOf(
-            "name" to config.getName(),
-            "rule_id" to config.getRuleID(),
-            "secondary" to
-                (config.secondaryExposuresJson ?: toJson(config.getSecondaryExposures())),
-            "reason" to details.getDetailedReasonString(),
-            "lcut" to details.lcut,
-            "received_at" to details.receivedAt,
-            "rule_passed" to config.getRulePassed(),
-            "manual" to isManual
+        return StatsigDb.Params(
+            mapOf(
+                "name" to config.getName(),
+                "rule_id" to config.getRuleID(),
+                "secondary" to
+                    (config.secondaryExposuresJson ?: toJson(config.getSecondaryExposures())),
+                "reason" to details.getDetailedReasonString(),
+                "lcut" to details.lcut,
+                "received_at" to details.receivedAt,
+                "rule_passed" to config.getRulePassed(),
+                "manual" to isManual
+            )
         )
     }
 
@@ -731,17 +736,19 @@ class StatsigClient : LifecycleEventListener {
             toJson(layer.getSecondaryExposures()),
             toJson(layer.getUndelegatedSecondaryExposures())
         ).also { layer.exposureJson = it }
-        return mapOf(
-            "name" to layer.getName(),
-            "rule_id" to layer.getRuleIDForParameter(parameterName),
-            "parameter" to parameterName,
-            "explicit" to json.explicit,
-            "allocated" to layer.getAllocatedExperimentName(),
-            "secondary" to json.secondary,
-            "undelegated" to json.undelegated,
-            "reason" to details.getDetailedReasonString(),
-            "received_at" to details.receivedAt,
-            "manual" to isManual
+        return StatsigDb.Params(
+            mapOf(
+                "name" to layer.getName(),
+                "rule_id" to layer.getRuleIDForParameter(parameterName),
+                "parameter" to parameterName,
+                "explicit" to json.explicit,
+                "allocated" to layer.getAllocatedExperimentName(),
+                "secondary" to json.secondary,
+                "undelegated" to json.undelegated,
+                "reason" to details.getDetailedReasonString(),
+                "received_at" to details.receivedAt,
+                "manual" to isManual
+            )
         )
     }
 

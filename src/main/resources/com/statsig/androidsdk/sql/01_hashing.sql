@@ -15,6 +15,12 @@ CREATE TEMP TABLE IF NOT EXISTS hash_input (
   input TEXT NOT NULL
 );
 
+-- djb2 requests can also go here: a statement inserting into hash_input is compiled with the
+-- (large) SHA-256 program, one inserting into djb2_input is not.
+CREATE TEMP TABLE IF NOT EXISTS djb2_input (
+  input TEXT NOT NULL
+);
+
 CREATE TEMP TABLE IF NOT EXISTS hash_memo (
   algo TEXT NOT NULL,
   input TEXT NOT NULL,
@@ -22,11 +28,32 @@ CREATE TEMP TABLE IF NOT EXISTS hash_memo (
   PRIMARY KEY (algo, input)
 );
 
+-- 31^k mod 2^32 for k < 512. DJB2 is h = 31 * h + c per UTF-16 unit, so for n units
+-- h = sum(c_i * 31^(n - i)) mod 2^32: one indexed scan instead of a recursion. (TEMP: a main
+-- table would make every statement reading it take the database file lock.)
+CREATE TEMP TABLE IF NOT EXISTS djb2_pow (
+  k INTEGER PRIMARY KEY,
+  p INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO djb2_pow (k, p)
+  WITH RECURSIVE w(k, p) AS (SELECT 0, 1 UNION ALL SELECT k + 1, (p * 31) & 4294967295 FROM w WHERE k < 511)
+  SELECT k, p FROM w WHERE NOT EXISTS (SELECT 1 FROM djb2_pow WHERE k = 511);
+
 CREATE TEMP VIEW IF NOT EXISTS djb2_output AS
 WITH RECURSIVE
-  -- one row per character; astral characters count as a UTF-16 surrogate pair (two steps)
+  -- The sum form, for inputs of up to 512 characters, none of them outside the BMP (NULL
+  -- otherwise: count(*) falls short of the length, or a character needs two UTF-16 units).
+  -- The same expression is inlined in get_value.
+  fast(input, h) AS (
+    SELECT i.input, (
+      SELECT CASE WHEN count(*) = length(i.input) AND max(c) <= 65535 THEN sum(c * p) & 4294967295 END
+      FROM (SELECT unicode(substr(i.input, length(i.input) - k, 1)) AS c, p
+            FROM djb2_pow WHERE k < length(i.input)))
+    FROM (SELECT input FROM hash_input WHERE algo = 'djb2' UNION ALL SELECT input FROM djb2_input) AS i
+  ),
+  -- Otherwise one row per character; astral characters count as a UTF-16 surrogate pair (two steps)
   d(input, i, n, h) AS (
-    SELECT input, 1, length(input), 0 FROM hash_input WHERE algo = 'djb2'
+    SELECT input, 1, length(input), 0 FROM fast WHERE h IS NULL
     UNION ALL
     SELECT input, i + 1, n,
       CASE WHEN unicode(substr(input, i, 1)) > 65535 THEN
@@ -37,6 +64,8 @@ WITH RECURSIVE
       END
     FROM d WHERE i <= n
   )
+SELECT 'djb2' AS algo, input, CAST(h AS TEXT) AS output FROM fast WHERE h IS NOT NULL
+UNION ALL
 SELECT 'djb2' AS algo, input, CAST(h AS TEXT) AS output FROM d WHERE i = n + 1;
 
 -- SHA-256 as a recursive CTE: one row per compression round (t = 0..63) plus one row per block
@@ -140,6 +169,12 @@ WHEN NEW.algo = 'djb2'
 BEGIN
   INSERT OR IGNORE INTO hash_memo (algo, input, output) SELECT algo, input, output FROM djb2_output;
   DELETE FROM hash_input;
+END;
+
+CREATE TEMP TRIGGER IF NOT EXISTS djb2_input_memo AFTER INSERT ON djb2_input
+BEGIN
+  INSERT OR IGNORE INTO hash_memo (algo, input, output) SELECT algo, input, output FROM djb2_output;
+  DELETE FROM djb2_input;
 END;
 
 CREATE TEMP TRIGGER IF NOT EXISTS hash_input_sha256 AFTER INSERT ON hash_input

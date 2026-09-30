@@ -10,7 +10,10 @@
 --                  it reports no progress (one round per level of gate nesting),
 --   eval_result    returns the answer.
 
--- name: schema
+-- name: dcs_load
+-- OnDeviceEvalAdapter.setData: replaces the specs (a payload that is not JSON is ignored).
+-- The evaluator's tables are created by the first load, so that clients without on-device
+-- evaluation never pay for them.
 
 CREATE TEMP TABLE IF NOT EXISTS dcs (
   id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -255,8 +258,7 @@ FROM (
 ) AS x;
 
 
--- name: dcs_load
--- OnDeviceEvalAdapter.setData: replaces the specs (a payload that is not JSON is ignored).
+-- Loading the specs.
 DELETE FROM dcs WHERE json_valid(:payload);
 DELETE FROM dcs_spec WHERE json_valid(:payload);
 DELETE FROM dcs_rule WHERE json_valid(:payload);

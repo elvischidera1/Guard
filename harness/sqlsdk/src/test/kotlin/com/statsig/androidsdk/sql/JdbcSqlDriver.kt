@@ -2,40 +2,51 @@ package com.statsig.androidsdk.sql
 
 import java.sql.Connection
 import java.sql.DriverManager
-import java.sql.PreparedStatement
-import java.sql.Types
+import org.sqlite.SQLiteConnection
+import org.sqlite.core.NativeDB
+import org.sqlite.core.NativeStatements
 
-/** [SqlDriver] for the JVM (xerial sqlite-jdbc), used by the harness in place of Android's SQLite. */
+/**
+ * [SqlDriver] for the JVM, used by the harness in place of Android's SQLite. It opens the
+ * database with xerial sqlite-jdbc (which bundles SQLite) but runs statements through SQLite's
+ * own statement API (prepare once, then bind / step / read columns / reset), like Android's
+ * framework binding does, rather than through the JDBC wrapper, whose per-call bookkeeping
+ * costs several microseconds per statement, parameter and column.
+ */
 internal class JdbcSqlDriver(path: String) : SqlDriver {
-    // get_generated_keys=false: otherwise sqlite-jdbc runs "SELECT last_insert_rowid()" after
-    // every INSERT, which the SDK never needs.
-    private val connection: Connection =
-        DriverManager.getConnection("jdbc:sqlite:$path?jdbc.get_generated_keys=false")
-    private val statements = HashMap<String, PreparedStatement>()
-    private val columns = HashMap<String, List<String>>()
+    private val connection: Connection = DriverManager.getConnection("jdbc:sqlite:$path")
+    private val native = NativeStatements((connection as SQLiteConnection).database as NativeDB)
+    private val statements = HashMap<String, Long>()
+    private val columns = HashMap<Long, Array<String>>()
 
-    override fun execute(sql: String, args: List<Any?>): Int = prepare(sql, args).executeUpdate()
-
-    override fun query(sql: String, args: List<Any?>): List<Row> {
-        prepare(sql, args).executeQuery().use { rs ->
-            val names = columns.getOrPut(sql) { rs.metaData.let { m -> (1..m.columnCount).map { m.getColumnLabel(it) } } }
-            val rows = ArrayList<Row>()
-            while (rs.next()) {
-                val row = HashMap<String, Any?>(names.size * 2)
-                names.forEachIndexed { i, name ->
-                    row[name] = when (val v = rs.getObject(i + 1)) {
-                        is Int -> v.toLong()
-                        is Float -> v.toDouble()
-                        else -> v
-                    }
-                }
-                rows.add(row)
-            }
-            return rows
+    override fun execute(sql: String, args: List<Any?>): Int {
+        val statement = prepare(sql, args)
+        try {
+            while (native.step(statement, sql)) Unit
+            return native.changes()
+        } finally {
+            native.done(statement)
         }
     }
 
-    // Plain SQL (cached statements) rather than setAutoCommit(), which re-prepares each time.
+    override fun query(sql: String, args: List<Any?>): List<Row> {
+        val statement = prepare(sql, args)
+        try {
+            val names = columns.getOrPut(statement) {
+                Array(native.columnCount(statement)) { native.columnName(statement, it) }
+            }
+            val rows = ArrayList<Row>()
+            while (native.step(statement, sql)) {
+                val row = HashMap<String, Any?>(names.size * 2)
+                for (i in names.indices) row[names[i]] = native.column(statement, i)
+                rows.add(row)
+            }
+            return rows
+        } finally {
+            native.done(statement)
+        }
+    }
+
     override fun beginTransaction() {
         execute("BEGIN", emptyList())
     }
@@ -49,21 +60,14 @@ internal class JdbcSqlDriver(path: String) : SqlDriver {
     }
 
     override fun close() {
-        statements.values.forEach { it.close() }
+        statements.values.forEach { native.finalize(it) }
+        statements.clear()
         connection.close()
     }
 
-    private fun prepare(sql: String, args: List<Any?>): PreparedStatement {
-        val statement = statements.getOrPut(sql) { connection.prepareStatement(sql) }
-        args.forEachIndexed { i, arg ->
-            when (arg) {
-                null -> statement.setNull(i + 1, Types.NULL)
-                is Long -> statement.setLong(i + 1, arg)
-                is Double -> statement.setDouble(i + 1, arg)
-                is ByteArray -> statement.setBytes(i + 1, arg)
-                else -> statement.setString(i + 1, arg.toString())
-            }
-        }
+    private fun prepare(sql: String, args: List<Any?>): Long {
+        val statement = statements.getOrPut(sql) { native.prepare(sql) }
+        args.forEachIndexed { i, arg -> native.bind(statement, i + 1, arg) }
         return statement
     }
 }

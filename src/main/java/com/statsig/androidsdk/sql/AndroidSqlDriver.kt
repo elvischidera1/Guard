@@ -8,8 +8,10 @@ import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteProgram
 
 /**
- * [SqlDriver] over the framework's SQLite. The database is opened without write-ahead logging, so
- * the framework uses a single connection and TEMP tables persist between calls.
+ * [SqlDriver] over the framework's SQLite. The database is opened without the framework's
+ * write-ahead logging (ENABLE_WRITE_AHEAD_LOGGING adds a pool of reader connections), so it uses a
+ * single connection and TEMP tables persist between calls. The SQL's `connect` block switches the
+ * journal to WAL itself.
  *
  * The SQL needs SQLite 3.38+ (JSON functions and the -> / ->> operators), i.e. Android 14 (API 34)
  * and newer. On older devices a bundled SQLite (e.g. androidx.sqlite's BundledSQLiteDriver or
