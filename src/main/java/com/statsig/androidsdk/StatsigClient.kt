@@ -51,6 +51,31 @@ class StatsigClient : LifecycleEventListener {
     }
 
     private lateinit var db: StatsigDb
+
+    // Parameters of the hot lookups, built once per name
+    private val gateParams = StatsigDb.ParamsMemo { mapOf("kind" to "gate", "name" to it) }
+    private val configParams = StatsigDb.ParamsMemo { mapOf("kind" to "config", "name" to it) }
+    private val paramStoreParams =
+        StatsigDb.ParamsMemo { mapOf("kind" to "param_store", "name" to it) }
+    private val nonExposedParams = StatsigDb.ParamsMemo { mapOf("name" to it) }
+
+    // get_experiment parameters by (keep, logs); "logs" is not a SQL parameter: it keeps cached
+    // layers with and without a client apart
+    private val experimentParams = Array(4) { i ->
+        StatsigDb.ParamsMemo { mapOf("name" to it, "kind" to "config", "keep" to (i and 1 != 0)) }
+    }
+    private val layerParams = Array(4) { i ->
+        StatsigDb.ParamsMemo {
+            mapOf(
+                "name" to it,
+                "kind" to "layer",
+                "keep" to (i and 1 != 0),
+                "logs" to (i and 2 != 0)
+            )
+        }
+    }
+
+    private fun flags(keep: Boolean, logs: Boolean) = (if (keep) 1 else 0) + (if (logs) 2 else 0)
     private lateinit var diagnostics: Diagnostics
     private lateinit var network: StatsigNetwork
 
@@ -446,10 +471,10 @@ class StatsigClient : LifecycleEventListener {
         )
         errorBoundary.capture(
             {
-                db.run("count_non_exposed", mapOf("name" to parameterStoreName))
+                db.run("count_non_exposed", nonExposedParams[parameterStoreName])
                 val (parameters, details) = db.read(
                     "get_value",
-                    mapOf("kind" to "param_store", "name" to parameterStoreName)
+                    paramStoreParams[parameterStoreName]
                 ) { rows ->
                     jsonParamStore(rows.first().string("value")) to
                         rows.first().evalDetails(session())
@@ -479,7 +504,7 @@ class StatsigClient : LifecycleEventListener {
         var result: FeatureGate? = null
         errorBoundary.capture(
             {
-                if (!logExposure) db.run("count_non_exposed", mapOf("name" to gateName))
+                if (!logExposure) db.run("count_non_exposed", nonExposedParams[gateName])
                 val gate = getFeatureGateEvaluation(gateName)
                 if (logExposure) logGateExposure(gate, isManual = false)
                 result = gate
@@ -499,16 +524,18 @@ class StatsigClient : LifecycleEventListener {
         evaluate: () -> DynamicConfig
     ): DynamicConfig {
         enforceInitialized(functionName)
-        var result = DynamicConfig.getError(name)
+        var evaluated: DynamicConfig? = null
         errorBoundary.capture(
             {
-                if (!logExposure) db.run("count_non_exposed", mapOf("name" to name))
-                result = evaluate()
-                if (logExposure) logConfigExposure(result, isManual = false)
+                if (!logExposure) db.run("count_non_exposed", nonExposedParams[name])
+                val config = evaluate()
+                if (logExposure) logConfigExposure(config, isManual = false)
+                evaluated = config
             },
             tag = functionName,
             configName = name
         )
+        val result = evaluated ?: DynamicConfig.getError(name)
         options.evaluationCallback?.invoke(result)
         return result
     }
@@ -520,29 +547,30 @@ class StatsigClient : LifecycleEventListener {
         logExposure: Boolean
     ): Layer {
         enforceInitialized(functionName)
-        var layer = Layer.getError(layerName)
+        var evaluated: Layer? = null
         errorBoundary.capture(
             {
-                if (!logExposure) db.run("count_non_exposed", mapOf("name" to layerName))
-                layer =
+                if (!logExposure) db.run("count_non_exposed", nonExposedParams[layerName])
+                evaluated =
                     getLayerEvaluation(if (logExposure) this else null, layerName, keepDeviceValue)
             },
             tag = functionName,
             configName = layerName
         )
+        val layer = evaluated ?: Layer.getError(layerName)
         options.evaluationCallback?.invoke(layer)
         return layer
     }
 
     private fun getFeatureGateEvaluation(gateName: String): FeatureGate {
-        val gate = db.read("get_value", mapOf("kind" to "gate", "name" to gateName)) {
+        val gate = db.read("get_value", gateParams[gateName]) {
             it.first().toFeatureGate(gateName, session())
         }
         return onDeviceEvalAdapter?.getGate(gate, user) ?: gate
     }
 
     private fun getDynamicConfigEvaluation(configName: String): DynamicConfig {
-        val config = db.read("get_value", mapOf("kind" to "config", "name" to configName)) {
+        val config = db.read("get_value", configParams[configName]) {
             it.first().toDynamicConfig(configName, session())
         }
         return onDeviceEvalAdapter?.getDynamicConfig(config, user) ?: config
@@ -554,7 +582,7 @@ class StatsigClient : LifecycleEventListener {
     ): DynamicConfig {
         val experiment = db.read(
             "get_experiment",
-            mapOf("name" to experimentName, "kind" to "config", "keep" to keepDeviceValue)
+            experimentParams[flags(keepDeviceValue, false)][experimentName]
         ) { it.first().toDynamicConfig(experimentName, session()) }
         return onDeviceEvalAdapter?.getDynamicConfig(experiment, user) ?: experiment
     }
@@ -564,15 +592,9 @@ class StatsigClient : LifecycleEventListener {
         layerName: String,
         keepDeviceValue: Boolean
     ): Layer {
-        // "logs" is not a SQL parameter: it keeps cached layers with and without a client apart
         val layer = db.read(
             "get_experiment",
-            mapOf(
-                "name" to layerName,
-                "kind" to "layer",
-                "keep" to keepDeviceValue,
-                "logs" to (client != null)
-            )
+            layerParams[flags(keepDeviceValue, client != null)][layerName]
         ) { it.first().toLayer(client, layerName, session()) }
         return onDeviceEvalAdapter?.getLayer(client, layer, user) ?: layer
     }

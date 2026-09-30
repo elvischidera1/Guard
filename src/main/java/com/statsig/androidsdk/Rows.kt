@@ -20,9 +20,17 @@ internal fun Row.bool(column: String): Boolean = long(column)?.let { it != 0L } 
 internal fun jsonMap(json: String?): Map<String, Any> =
     json?.let { gson.fromJson<Map<String, Any>>(it, mapType) } ?: emptyMap()
 
-/** A JSON value that should be an object; anything else reads as an empty map. */
-internal fun jsonObject(json: String?): Map<String, Any> =
-    if (json != null && json.trimStart().startsWith("{")) jsonMap(json) else emptyMap()
+/**
+ * A JSON value that should be an object; anything else reads as an empty map. (A LinkedHashMap:
+ * same order as Gson's map, constant-time lookups for the config getters.)
+ */
+internal fun jsonObject(json: String?): Map<String, Any> = if (json != null &&
+    json.trimStart().startsWith("{")
+) {
+    LinkedHashMap(jsonMap(json))
+} else {
+    emptyMap()
+}
 
 internal fun jsonExposures(json: String?): Array<Map<String, String>> =
     json?.let { gson.fromJson<Array<Map<String, String>>>(it, exposuresType) } ?: arrayOf()

@@ -1,6 +1,8 @@
 package com.statsig.androidsdk.sql
 
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLongArray
 
 /**
  * Runs the named SQL blocks for one client. A block is atomic (a transaction when it writes more
@@ -21,13 +23,32 @@ internal class StatsigDb(
     private val driver: SqlDriver,
     private val script: SqlScript = SqlScript.default
 ) {
-    private companion object {
-        const val DEFER_LIMIT = 50
-        const val CACHE_LIMIT = 16384
+    companion object {
+        private const val DEFER_LIMIT = 50
+        private const val CACHE_LIMIT = 16384
+        private const val RAN = -1
+
+        /**
+         * A map's hash for the cache keys. Map.hashCode() sums key ^ value per entry, which
+         * collides a lot for parameter maps that differ in correlated strings (name, rule id);
+         * each entry is mixed first here. Order-independent, like map equality.
+         */
+        private fun contentHash(map: Map<String, Any?>): Int {
+            if (map is Params) return map.contentHash
+            var h = 0
+            for ((k, v) in map) {
+                var x = k.hashCode() * 0x9E3779B1.toInt() + (v?.hashCode() ?: 0)
+                x = (x xor (x ushr 16)) * 0x85EBCA6B.toInt()
+                x = (x xor (x ushr 13)) * 0xC2B2AE35.toInt()
+                h += x xor (x ushr 16)
+            }
+            return h
+        }
     }
 
     private class Key(val block: String, val params: Map<String, Any?>, val tag: Class<*>?) {
-        private val hash = (block.hashCode() * 31 + params.hashCode()) * 31 + tag.hashCode()
+        private val hash =
+            (block.hashCode() * 31 + contentHash(params)) * 31 + System.identityHashCode(tag)
         override fun hashCode() = hash
         override fun equals(other: Any?) = other is Key && other.hash == hash &&
             other.block == block && other.tag == tag &&
@@ -40,20 +61,70 @@ internal class StatsigDb(
      */
     class Params(private val map: Map<String, Any?>) : Map<String, Any?> by map {
         private val hash = map.hashCode()
+        internal val contentHash = contentHash(map)
+
+        /** The last cached result (or @quiet state) for these parameters: skips the maps. */
+        @Volatile
+        internal var slot: Slot? = null
         override fun hashCode() = hash
         override fun equals(other: Any?) = other === this || map == other
         override fun toString() = map.toString()
     }
 
-    /** A queued call: its parameters (plus time/repeat), and its key if coalesced or quiet. */
+    /** [Params] per name, built once (bounded): for call sites that pass the same shape often. */
+    class ParamsMemo(private val make: (String) -> Map<String, Any?>) {
+        private val memo = ConcurrentHashMap<String, Params>()
+
+        operator fun get(name: String): Params = memo[name] ?: Params(make(name)).also {
+            if (memo.size >= CACHE_LIMIT) memo.clear()
+            memo[name] = it
+        }
+    }
+
+    /**
+     * A queued call: its parameters (plus time/repeat), and its key if coalesced or quiet.
+     * [repeat] counts merged calls until the call runs, then reads [RAN].
+     */
     private class Deferred(
         val block: SqlScript.Block,
         val key: Key?,
         val params: MutableMap<String, Any?>
-    )
+    ) {
+        val repeat = AtomicInteger(1)
+
+        /** Merges one more identical call; false if this call already ran. */
+        fun merge(): Boolean {
+            while (true) {
+                val n = repeat.get()
+                if (n == RAN) return false
+                if (repeat.compareAndSet(n, n + 1)) return true
+            }
+        }
+    }
 
     /** Cached for a `@quiet` block: identical calls before [until] change nothing. */
     private class Quiet(val until: Long)
+
+    /** A cached value for (block, tag), valid while the block's read domains are at [gens]. */
+    internal class Slot(
+        val block: SqlScript.Block,
+        val tag: Class<*>?,
+        val gens: LongArray,
+        val value: Any
+    )
+
+    /** Per domain, bumped whenever its cached results are dropped. */
+    private val generations = AtomicLongArray(script.domains.size)
+
+    private fun gens(block: SqlScript.Block) =
+        LongArray(block.readIds.size) { generations.get(block.readIds[it]) }
+
+    private fun Slot.valid(block: SqlScript.Block, tag: Class<*>?): Boolean {
+        if (this.block !== block || this.tag !== tag) return false
+        val ids = block.readIds
+        for (i in ids.indices) if (generations.get(ids[i]) != gens[i]) return false
+        return true
+    }
 
     /** Cached results by the data they were read from. */
     private val cache = ConcurrentHashMap<String, ConcurrentHashMap<Key, Any>>()
@@ -61,7 +132,7 @@ internal class StatsigDb(
     /** Queued calls in call order, and the coalescable ones by (block, params). */
     private val deferred = ArrayList<Deferred>()
     private val deferredBlocks = HashSet<SqlScript.Block>()
-    private val coalesced = HashMap<Key, Deferred>()
+    private val coalesced = ConcurrentHashMap<Key, Deferred>()
 
     /** Called when a bulk run of deferred blocks reports `should_flush`. */
     @Volatile
@@ -103,14 +174,18 @@ internal class StatsigDb(
             defer(block, params)
             return transform(emptyList())
         }
+        if (block.cache && params is Params) {
+            params.slot?.let { if (it.valid(block, tag)) return it.value as T }
+        }
         val key = if (block.cache) Key(name, params, tag) else null
         if (key != null) {
-            for (domain in block.reads) cache[domain]?.get(key)?.let { return it as T }
+            for (domain in block.readList) cache[domain]?.get(key)?.let { return it as T }
         }
         var flush = false
         val result = synchronized(this) {
             check(!closed) { "Statsig database is closed" }
             if (deferred.isNotEmpty() && dependsOnDeferred(block)) flush = drain()
+            val gens = if (key != null) gens(block) else null
             var rows = execute(block, params)
             val then = rows.firstOrNull()?.get("_then") as String?
             if (then != null) {
@@ -122,10 +197,11 @@ internal class StatsigDb(
             }
             if (cacheable) {
                 val value = transform(rows)
-                for (domain in block.reads) put(domain, key!!, value)
+                for (domain in block.readList) put(domain, key!!, value)
+                if (params is Params) params.slot = Slot(block, tag, gens!!, value)
                 value
             } else {
-                invalidate(block.writes)
+                invalidate(block)
                 transform(rows)
             }
         }
@@ -152,23 +228,30 @@ internal class StatsigDb(
         } else {
             null
         }
+        if (block.quietMs != null && params is Params) {
+            val slot = params.slot
+            if (slot != null && slot.valid(block, Quiet::class.java) &&
+                System.currentTimeMillis() < (slot.value as Quiet).until
+            ) {
+                return
+            }
+        }
         if (key != null && block.quietMs != null) {
             val now = System.currentTimeMillis()
-            for (domain in block.reads) {
+            for (domain in block.readList) {
                 val quiet = cache[domain]?.get(key) as Quiet?
                 if (quiet != null && now < quiet.until) return
             }
         }
+        // An identical queued call absorbs this one without the lock.
+        if (block.coalesce && coalesced[key!!]?.merge() == true) return
         val flush = synchronized(this) {
             check(!closed) { "Statsig database is closed" }
             val existing = if (block.coalesce) coalesced[key!!] else null
-            if (existing != null) {
-                existing.params["repeat"] = (existing.params["repeat"] as Int) + 1
-            } else {
+            if (existing == null || !existing.merge()) {
                 val call = HashMap<String, Any?>(params.size + 2)
                 call.putAll(params)
                 call["time"] = System.currentTimeMillis()
-                call["repeat"] = 1
                 val entry = Deferred(block, key, call)
                 deferred.add(entry)
                 deferredBlocks.add(block)
@@ -202,6 +285,7 @@ internal class StatsigDb(
         driver.beginTransaction()
         try {
             for ((i, call) in calls.withIndex()) {
+                call.params["repeat"] = call.repeat.getAndSet(RAN)
                 val statements = call.block.statements
                 try {
                     val changed = update(statements[0], call.params)
@@ -224,10 +308,12 @@ internal class StatsigDb(
             runCatching { driver.rollback() }.exceptionOrNull()?.let { e.addSuppressed(it) }
             throw e
         }
-        for (block in calls.mapTo(HashSet()) { it.block }) invalidate(block.writes)
+        for (block in calls.mapTo(HashSet()) { it.block }) invalidate(block)
         for (call in quiet) {
             val until = Quiet(call.params["time"] as Long + call.block.quietMs!!)
-            for (domain in call.block.reads) put(domain, call.key!!, until)
+            for (domain in call.block.readList) put(domain, call.key!!, until)
+            (call.key!!.params as? Params)?.slot =
+                Slot(call.block, Quiet::class.java, gens(call.block), until)
         }
         failure?.let { throw it }
         return flush
@@ -239,8 +325,9 @@ internal class StatsigDb(
         entries[key] = value
     }
 
-    private fun invalidate(domains: Set<String>) {
-        for (domain in domains) cache[domain]?.clear()
+    private fun invalidate(block: SqlScript.Block) {
+        for (id in block.writeIds) generations.incrementAndGet(id)
+        for (domain in block.writes) cache[domain]?.clear()
     }
 
     private fun execute(block: SqlScript.Block, params: Map<String, Any?>): List<Row> {

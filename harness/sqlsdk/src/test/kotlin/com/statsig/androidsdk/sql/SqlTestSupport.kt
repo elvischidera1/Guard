@@ -19,6 +19,9 @@ internal fun StatsigDb.exec(sql: String, vararg args: Any?) {
 internal fun StatsigDb.forgetCaches() {
     val field = StatsigDb::class.java.getDeclaredField("cache").apply { isAccessible = true }
     (field.get(this) as MutableMap<*, *>).clear()
+    val gens = StatsigDb::class.java.getDeclaredField("generations").apply { isAccessible = true }
+        .get(this) as java.util.concurrent.atomic.AtomicLongArray
+    for (i in 0 until gens.length()) gens.incrementAndGet(i)
 }
 
 internal fun StatsigDb.scalar(sql: String, vararg args: Any?): Any? {

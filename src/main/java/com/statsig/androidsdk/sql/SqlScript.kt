@@ -10,6 +10,17 @@ package com.statsig.androidsdk.sql
  */
 internal class SqlScript private constructor(val blocks: Map<String, Block>) {
 
+    /** Every data domain named by a directive; a block's [Block.readIds] / [Block.writeIds]. */
+    val domains: List<String> =
+        blocks.values.flatMap { it.reads + it.writes }.distinct().sorted()
+
+    init {
+        for (block in blocks.values) {
+            block.readIds = block.reads.map { domains.indexOf(it) }.toIntArray()
+            block.writeIds = block.writes.map { domains.indexOf(it) }.toIntArray()
+        }
+    }
+
     class Statement(val sql: String, val params: List<String>, val returnsRows: Boolean)
 
     /**
@@ -35,7 +46,15 @@ internal class SqlScript private constructor(val blocks: Map<String, Block>) {
         val defer: Boolean,
         val coalesce: Boolean,
         val quietMs: Long? = null
-    )
+    ) {
+        /** [reads] as a list (iterated on every cached read). */
+        val readList: List<String> = reads.toList()
+
+        var readIds = IntArray(0)
+            internal set
+        var writeIds = IntArray(0)
+            internal set
+    }
 
     fun block(name: String): Block =
         blocks[name] ?: throw IllegalArgumentException("Unknown SQL block: $name")
