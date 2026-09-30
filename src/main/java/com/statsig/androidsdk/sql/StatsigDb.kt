@@ -162,6 +162,17 @@ internal class StatsigDb private constructor(
         return true
     }
 
+    /**
+     * Whether a result for (block, tag) is kept in (and looked up in) [cache]: [Params] keep their
+     * last result in their slot, so the map is only needed when that slot is taken by another
+     * block or call site (the same parameters read two ways).
+     */
+    private fun needsMap(params: Map<String, Any?>, block: SqlScript.Block, tag: Class<*>?): Boolean {
+        if (params !is Params) return true
+        val slot = params.slot ?: return false
+        return slot.block !== block || slot.tag !== tag
+    }
+
     /** Cached results by the data they were read from. */
     private val cache = ConcurrentHashMap<String, ConcurrentHashMap<Key, Any>>()
 
@@ -219,7 +230,7 @@ internal class StatsigDb private constructor(
         if (block.cache && params is Params) {
             params.slot?.let { if (it.valid(block, tag)) return it.value as T }
         }
-        val key = if (block.cache) Key(name, params, tag) else null
+        val key = if (block.cache && needsMap(params, block, tag)) Key(name, params, tag) else null
         if (key != null) {
             for (domain in block.readList) cache[domain]?.get(key)?.let { return it as T }
         }
@@ -227,19 +238,19 @@ internal class StatsigDb private constructor(
         val result = synchronized(this) {
             check(!closed) { "Statsig database is closed" }
             if (deferred.isNotEmpty() && dependsOnDeferred(block)) flush = drain()
-            val gens = if (key != null) gens(block) else null
+            val gens = if (block.cache) gens(block) else null
             var rows = execute(block, params)
             val then = rows.firstOrNull()?.get("_then") as String?
             if (then != null) {
                 execute(script.block(then), params)
                 rows = execute(block, params)
             }
-            val cacheable = key != null && rows.firstOrNull()?.get("_cacheable").let {
+            val cacheable = block.cache && rows.firstOrNull()?.get("_cacheable").let {
                 it == null || it != 0L
             }
             if (cacheable) {
                 val value = transform(rows)
-                for (domain in block.readList) put(domain, key!!, value)
+                if (key != null) for (domain in block.readList) put(domain, key, value)
                 if (params is Params) params.slot = Slot(block, tag, gens!!, value)
                 value
             } else {
@@ -287,7 +298,7 @@ internal class StatsigDb private constructor(
                 return
             }
         }
-        if (key != null && block.quietMs != null) {
+        if (key != null && block.quietMs != null && needsMap(params, block, Quiet::class.java)) {
             val now = System.currentTimeMillis()
             for (domain in block.readList) {
                 val quiet = cache[domain]?.get(key) as Quiet?
@@ -362,9 +373,11 @@ internal class StatsigDb private constructor(
         for (block in calls.mapTo(HashSet()) { it.block }) invalidate(block)
         for (call in quiet) {
             val until = Quiet(call.params["time"] as Long + call.block.quietMs!!)
-            for (domain in call.block.readList) put(domain, call.key!!, until)
-            (call.key!!.params as? Params)?.slot =
-                Slot(call.block, Quiet::class.java, gens(call.block), until)
+            val params = call.key!!.params
+            if (needsMap(params, call.block, Quiet::class.java)) {
+                for (domain in call.block.readList) put(domain, call.key, until)
+            }
+            if (params is Params) params.slot = Slot(call.block, Quiet::class.java, gens(call.block), until)
         }
         failure?.let { throw it }
         return flush

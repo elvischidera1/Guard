@@ -21,8 +21,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 private const val DATABASE_NAME = "statsig.db"
@@ -109,7 +107,8 @@ class StatsigClient : LifecycleEventListener {
             Log.w(TAG, "Retrying failed log requests failed", e)
         }
     )
-    private val flushLock = Mutex()
+    private val backgroundFlush = AtomicBoolean(false)
+    private val flushRequested = AtomicBoolean(false)
     private var pollingJob: Job? = null
     private var flushTimer: Job? = null
 
@@ -239,7 +238,7 @@ class StatsigClient : LifecycleEventListener {
         )
         importLegacyStorage()
         // flush when the SQL says the event queue is full
-        db.onShouldFlush = { statsigScope.launch(dispatcherProvider.io) { flushEvents() } }
+        db.onShouldFlush = ::flushInBackground
         diagnostics = Diagnostics(db)
         diagnostics.markStart(KeyType.OVERALL, ContextType.INITIALIZE)
 
@@ -841,29 +840,47 @@ class StatsigClient : LifecycleEventListener {
         errorBoundary.capture(log, tag = functionName, configName = name)
     }
 
+    /**
+     * Sends the queued events. take_batch takes them atomically, so flushes need no lock of their
+     * own and their requests may overlap, as the original's did.
+     */
     private suspend fun flushEvents() {
-        flushLock.withLock {
-            val batch = db.one(
-                "take_batch",
-                mapOf(
-                    "metadata" to toJson(statsigClientMetadata),
-                    "logging_enabled" to loggingEnabled
-                )
+        val batch = db.one(
+            "take_batch",
+            mapOf(
+                "metadata" to toJson(statsigClientMetadata),
+                "logging_enabled" to loggingEnabled
             )
-            if (batch == null) {
-                if (!loggingEnabled) Log.d(TAG, "loggingEnabled is FALSE, flush() skipped")
-                return
-            }
-            val count = batch.long("n").toString()
-            network.postLogs(eventLoggingAPI, batch.string("body")!!, count, statsigClientMetadata)
-            Log.v(TAG, "flush() completed with $count events")
+        )
+        if (batch == null) {
+            if (!loggingEnabled) Log.d(TAG, "loggingEnabled is FALSE, flush() skipped")
+            return
         }
+        val count = batch.long("n").toString()
+        network.postLogs(eventLoggingAPI, batch.string("body")!!, count, statsigClientMetadata)
+        Log.v(TAG, "flush() completed with $count events")
     }
 
     private fun logDiagnostics(context: ContextType) {
         if (diagnostics.logDiagnostics(context)) {
-            statsigScope.launch(dispatcherProvider.io) {
-                flushEvents()
+            flushInBackground()
+        }
+    }
+
+    /**
+     * A flush for a full queue. One at a time: one asked for meanwhile runs when it is done and
+     * takes all the events queued by then, so a burst of events makes a few large requests
+     * rather than many small ones.
+     */
+    private fun flushInBackground() {
+        flushRequested.set(true)
+        if (!backgroundFlush.compareAndSet(false, true)) return
+        statsigScope.launch(dispatcherProvider.io) {
+            try {
+                while (flushRequested.getAndSet(false)) flushEvents()
+            } finally {
+                backgroundFlush.set(false)
+                if (flushRequested.get()) flushInBackground()
             }
         }
     }

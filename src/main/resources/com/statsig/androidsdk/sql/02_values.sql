@@ -241,7 +241,6 @@ SELECT value AS stable_id FROM setting WHERE key = 'stable_id';
 -- name: set_user
 -- @writes: values, events
 -- updateUser: switch the session to another user. Values stay until load_cache replaces them.
-DELETE FROM hash_memo WHERE rowid <= (SELECT max(rowid) FROM hash_memo) - 2048;
 INSERT INTO djb2_input (input)
   SELECT :user
   WHERE NOT EXISTS (SELECT 1 FROM hash_memo WHERE algo = 'djb2' AND input = :user);
@@ -388,7 +387,10 @@ INSERT INTO values_work (payload, user_hash, source, set_received, received_at, 
         'statsigEnvironment', json(json_extract(:values, '$.user.statsigEnvironment')))) END)), '{}'));
 DELETE FROM values_work;
 INSERT OR REPLACE INTO memory_values (cache_key, scoped_key, payload, bootstrap_metadata, source)
-  SELECT cache_key, scoped_key, :values, bootstrap_metadata, source FROM session;
+  SELECT s.cache_key, s.scoped_key, :values, s.bootstrap_metadata, s.source FROM session AS s
+  WHERE NOT EXISTS (SELECT 1 FROM memory_values AS m
+                    WHERE m.cache_key = s.cache_key AND m.scoped_key = s.scoped_key
+                      AND m.payload = :values);
 
 
 -- name: session_state
