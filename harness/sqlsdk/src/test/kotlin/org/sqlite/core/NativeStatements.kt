@@ -46,9 +46,9 @@ class NativeStatements(private val db: NativeDB) {
         }
     }
 
+    /** Resets for the next run (which binds every parameter again, so bindings need no clearing). */
     fun done(statement: Long) {
         db.reset(statement)
-        db.clear_bindings(statement)
     }
 
     fun columnCount(statement: Long) = db.column_count(statement)

@@ -23,6 +23,8 @@ internal class SqlScript private constructor(val blocks: Map<String, Block>) {
      * `@coalesce`: queued calls with identical parameters may be merged (`repeat` counts them);
      * `@quiet: <ms>`: after a call that changed rows, identical calls made within <ms> change
      * nothing, as long as nothing the block reads is written in between (so they may be skipped).
+     * Result columns: `_cacheable` = 0 (see `@cache`); `_then` = a block to run with the same
+     * parameters before running this block once more.
      */
     class Block(
         val name: String,

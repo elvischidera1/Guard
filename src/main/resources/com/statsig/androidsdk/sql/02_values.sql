@@ -12,7 +12,10 @@ CREATE TEMP TABLE IF NOT EXISTS bootstrap_evaluated_ids (key TEXT, value TEXT);
 
 -- Scratch row through which every set of values (network, cache, bootstrap) is applied.
 CREATE TEMP TABLE IF NOT EXISTS values_work (
-  payload TEXT NOT NULL,             -- initialize response JSON (v1 or compact "init-v2")
+  payload TEXT,                      -- initialize response JSON (v1 or compact "init-v2"), or
+  from_cache TEXT,                   -- the cached_values key of values stored as applied, with
+  cached_header TEXT,                -- their header
+
   user_hash TEXT NOT NULL,           -- user the values were computed for ('' if unknown)
   source TEXT NOT NULL,              -- EvalSource to report from now on
   set_received INTEGER NOT NULL,     -- 1: replace session.received_at with received_at
@@ -22,9 +25,10 @@ CREATE TEMP TABLE IF NOT EXISTS values_work (
   -- The top-level fields values_apply reads, in one pass over the payload (each pass over a
   -- large payload costs milliseconds): time, has_updates, hash_used, derived_fields,
   -- full_checksum, param_stores, sdk_flags, sdk_configs, response_format.
-  header TEXT GENERATED ALWAYS AS (json_extract(payload, '$.time', '$.has_updates', '$.hash_used',
-    '$.derived_fields', '$.full_checksum', '$.param_stores', '$.sdk_flags', '$.sdk_configs',
-    '$.response_format')) STORED
+  header TEXT GENERATED ALWAYS AS (CASE WHEN from_cache IS NULL THEN json_extract(payload,
+    '$.time', '$.has_updates', '$.hash_used', '$.derived_fields', '$.full_checksum',
+    '$.param_stores', '$.sdk_flags', '$.sdk_configs', '$.response_format')
+    ELSE cached_header END) STORED
 );
 
 -- Replaces the values in use: header fields on `session`, rows in `entity`. The values_work row
@@ -58,6 +62,10 @@ BEGIN
     WHERE s.type = 'object' AND e.type = 'object'
       AND (s.key = 'param_stores' OR (s.key IN ('feature_gates', 'dynamic_configs', 'layer_configs')
         AND NEW.header ->> 8 IS NOT 'init-v2'));
+
+  -- Values stored as applied.
+  INSERT OR REPLACE INTO entity_body (kind, name, body)
+    SELECT kind, name, body FROM cached_entity WHERE cache_key = NEW.from_cache;
 
   -- init-v2 (compact bootstrap format): short keys; values and exposures are shared through
   -- lookup tables referenced by id (read once into v2_value / v2_exposure). For other formats
@@ -146,10 +154,9 @@ CREATE TEMP TABLE IF NOT EXISTS lookup (
   writes INTEGER                     -- whether this get_experiment changes kept values
 );
 
+-- (The session-wide details, source/lcut/received_at, come from session_state.)
 CREATE TEMP VIEW IF NOT EXISTS lookup_result AS
 SELECT
-  l.kind,
-  l.name,
   l.override IS NOT NULL AS overridden,
   l.override IS NULL AND l.entity_name IS NOT NULL AS found,
   coalesce(l.override, l.value) AS value,
@@ -165,11 +172,8 @@ SELECT
   CASE WHEN l.override IS NULL THEN l.explicit_parameters END AS explicit_parameters,
   CASE WHEN l.override IS NULL THEN l.passed END AS rule_passed,
   CASE WHEN l.override IS NULL THEN l.parameter_rule_ids END AS parameter_rule_ids,
-  s.source,
-  l.reason,
-  s.lcut,
-  s.received_at
-FROM lookup AS l, session AS s;
+  l.reason
+FROM lookup AS l;
 
 -- How entity names are hashed for the values in use: NULL means names are served as-is.
 CREATE TEMP VIEW IF NOT EXISTS name_hash_algo AS
@@ -232,25 +236,30 @@ DELETE FROM exposure_seen;
 -- Lookup order: this client's bootstrap values, then disk by exact key, then disk through the
 -- custom cache key mapping.
 UPDATE session SET source = 'Loading';
-INSERT INTO values_work (payload, user_hash, source, set_received, received_at, bootstrap_metadata)
-  SELECT coalesce(found.payload, '{}'),
+INSERT INTO values_work
+    (payload, from_cache, cached_header, user_hash, source, set_received, received_at,
+     bootstrap_metadata)
+  SELECT CASE WHEN found.priority IS NULL THEN '{}' ELSE found.payload END,
+    found.from_cache,
+    found.header,
     coalesce(found.user_hash, ''),
-    CASE WHEN found.payload IS NULL THEN 'Loading' ELSE 'Cache' END,
-    found.payload IS NOT NULL,
+    CASE WHEN found.priority IS NULL THEN 'Loading' ELSE 'Cache' END,
+    found.priority IS NOT NULL,
     found.received_at,
     found.bootstrap_metadata
   FROM session AS s
     LEFT JOIN (
-      SELECT 1 AS priority, m.payload, '' AS user_hash, c.now_ms AS received_at, m.bootstrap_metadata
+      SELECT 1 AS priority, m.payload, NULL AS from_cache, NULL AS header, '' AS user_hash,
+        c.now_ms AS received_at, m.bootstrap_metadata
       FROM memory_values AS m, session AS s, clock AS c WHERE m.cache_key = s.cache_key
       UNION ALL
-      SELECT 2, m.payload, '', c.now_ms, m.bootstrap_metadata
+      SELECT 2, m.payload, NULL, NULL, '', c.now_ms, m.bootstrap_metadata
       FROM memory_values AS m, session AS s, clock AS c WHERE m.scoped_key = s.scoped_key
       UNION ALL
-      SELECT 3, v.payload, v.user_hash, v.received_at, NULL
+      SELECT 3, NULL, v.cache_key, v.header, v.user_hash, v.received_at, NULL
       FROM cached_values AS v, session AS s WHERE v.cache_key = s.cache_key
       UNION ALL
-      SELECT 4, v.payload, v.user_hash, v.received_at, NULL
+      SELECT 4, NULL, v.cache_key, v.header, v.user_hash, v.received_at, NULL
       FROM cached_values AS v, cache_key_map AS k, session AS s
       WHERE k.scoped_key = s.scoped_key AND v.cache_key = k.cache_key
       ORDER BY priority LIMIT 1
@@ -271,10 +280,17 @@ INSERT INTO values_work
   WHERE s.user = :user AND s.scoped_key = :scoped_key;
 UPDATE session SET source = 'NetworkNotModified', received_at = (SELECT now_ms FROM clock)
   WHERE EXISTS (SELECT 1 FROM values_work WHERE NOT coalesce(header ->> 1, 0));
--- Persist, remember which user the custom cache key points to, and keep the 10 most recent.
-INSERT OR REPLACE INTO cached_values (cache_key, user_hash, payload, received_at)
-  SELECT s.cache_key, s.user_hash, w.payload, s.received_at FROM session AS s, values_work AS w
+-- Persist (as applied), remember which user the custom cache key points to, and keep the 10 most
+-- recent.
+INSERT OR REPLACE INTO cached_values (cache_key, user_hash, header, received_at)
+  SELECT s.cache_key, s.user_hash, w.header, s.received_at FROM session AS s, values_work AS w
   WHERE w.header ->> 1;
+DELETE FROM cached_entity
+  WHERE cache_key = (SELECT cache_key FROM session)
+    AND EXISTS (SELECT 1 FROM values_work WHERE header ->> 1);
+INSERT INTO cached_entity (cache_key, kind, name, body)
+  SELECT s.cache_key, e.kind, e.name, e.body FROM session AS s, entity_body AS e
+  WHERE EXISTS (SELECT 1 FROM values_work WHERE header ->> 1);
 DELETE FROM memory_values
   WHERE cache_key = (SELECT cache_key FROM session)
     AND EXISTS (SELECT 1 FROM values_work WHERE header ->> 1);
@@ -285,6 +301,8 @@ DELETE FROM cache_key_map WHERE scoped_key IN (
   SELECT scoped_key FROM cache_key_map WHERE scoped_key <> :scoped_key
   ORDER BY last_used_at, scoped_key
   LIMIT max(0, (SELECT count(*) FROM cache_key_map) - 10));
+DELETE FROM cached_entity WHERE cache_key IN (
+  SELECT cache_key FROM cached_values WHERE cache_key NOT IN (SELECT cache_key FROM cache_key_map));
 DELETE FROM cached_values WHERE cache_key NOT IN (SELECT cache_key FROM cache_key_map);
 DELETE FROM sticky_value
   WHERE owner <> '' AND owner <> (SELECT cache_key FROM session)
@@ -385,22 +403,12 @@ FROM session;
 -- checkGate / getConfig / getParameterStore (:kind 'gate' | 'config' | 'param_store'): the local
 -- override, else the served entity (by name, then by hashed name). The columns of lookup_result
 -- that gates, configs and parameter stores use (every returned column costs the host a read).
--- :name's djb2 is computed inline (see djb2_output) and other hashes through hash_memo: only
--- sha256, and djb2 of names the inline form cannot take (over 512 characters or with characters
--- outside the BMP), go through hash_input.
-INSERT INTO hash_input (algo, input)
-  SELECT a.algo, :name FROM name_hash_algo AS a
-  WHERE (a.algo = 'sha256' OR (a.algo = 'djb2' AND (length(:name) > 512
-           OR :name GLOB '*[' || char(65536) || '-' || char(1114111) || ']*')))
-    AND NOT EXISTS (SELECT 1 FROM entity WHERE kind = :kind AND name = :name)
-    AND NOT EXISTS (SELECT 1 FROM hash_memo AS m WHERE m.algo = a.algo AND m.input = :name);
-WITH d(h) AS (
-  SELECT CASE WHEN count(*) = length(:name) AND max(c) <= 65535
-    THEN CAST(sum(c * p) & 4294967295 AS TEXT) END
-  FROM (SELECT unicode(substr(:name, length(:name) - k, 1)) AS c, p
-        FROM djb2_pow WHERE k < length(:name)))
+-- Like lookup_result, it leaves the session-wide details (source, lcut, received_at) to
+-- session_state.
+-- :name's djb2 is computed inline (the sum form of djb2_output) when the name allows it (up to
+-- 512 characters, none outside the BMP); other hashes come from hash_memo. When the one needed is
+-- not there yet, the row asks the host (_then) to run hash_name first and read again.
 SELECT
-  :name AS name,
   o.value IS NOT NULL AS overridden,
   o.value IS NULL AND e.name IS NOT NULL AS found,
   coalesce(o.value, e.value) AS value,
@@ -413,17 +421,34 @@ SELECT
   CASE WHEN o.value IS NULL THEN coalesce(e.is_device_based, 0) ELSE 0 END AS is_device_based,
   CASE WHEN o.value IS NULL THEN e.allocated_experiment_name END AS allocated_experiment_name,
   CASE WHEN o.value IS NULL THEN e.passed END AS rule_passed,
-  s.source,
   CASE WHEN o.value IS NOT NULL THEN 'LocalOverride' WHEN e.name IS NOT NULL THEN 'Recognized' ELSE 'Unrecognized' END AS reason,
-  s.lcut,
-  s.received_at
+  CASE WHEN e.name IS NULL AND s.hash_used IS NOT 'none' AND NOT (s.hash_used IS 'djb2' AND n.inline)
+      AND NOT EXISTS (SELECT 1 FROM hash_memo WHERE algo = n.algo AND input = :name)
+    THEN 'hash_name' END AS _then
 FROM session AS s
-  LEFT JOIN name_hash_algo AS a
+  JOIN (SELECT CASE hash_used WHEN 'djb2' THEN 'djb2' ELSE 'sha256' END AS algo,
+          length(:name) <= 512
+            AND NOT :name GLOB '*[' || char(65536) || '-' || char(1114111) || ']*' AS inline
+        FROM session) AS n
   LEFT JOIN override AS o ON o.kind = :kind AND o.name = :name
   LEFT JOIN entity AS e ON e.kind = :kind AND e.name = coalesce(
-    (SELECT name FROM entity WHERE kind = :kind AND name = :name),
-    CASE WHEN a.algo = 'djb2' THEN (SELECT h FROM d) END,
-    (SELECT output FROM hash_memo AS m WHERE m.algo = a.algo AND m.input = :name));
+    (SELECT name FROM entity_body WHERE kind = :kind AND name = :name),
+    CASE WHEN s.hash_used = 'djb2' AND n.inline
+      THEN (SELECT CAST(sum(unicode(substr(:name, length(:name) - k, 1)) * p) & 4294967295 AS TEXT)
+            FROM djb2_pow WHERE k < length(:name)) END,
+    CASE WHEN s.hash_used IS NOT 'none'
+      THEN (SELECT output FROM hash_memo WHERE algo = n.algo AND input = :name) END);
+
+
+-- name: hash_name
+-- Memoizes the hash get_value needs for :name (sha256, or djb2 of names its inline form cannot
+-- take).
+INSERT INTO hash_input (algo, input)
+  SELECT CASE s.hash_used WHEN 'djb2' THEN 'djb2' ELSE 'sha256' END, :name
+  FROM session AS s
+  WHERE s.hash_used IS NOT 'none'
+    AND NOT EXISTS (SELECT 1 FROM hash_memo
+      WHERE algo = CASE s.hash_used WHEN 'djb2' THEN 'djb2' ELSE 'sha256' END AND input = :name);
 
 
 -- name: get_experiment

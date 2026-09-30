@@ -452,7 +452,7 @@ class StatsigClient : LifecycleEventListener {
                     mapOf("kind" to "param_store", "name" to parameterStoreName)
                 ) { rows ->
                     jsonParamStore(rows.first().string("value")) to
-                        rows.first().evalDetails()
+                        rows.first().evalDetails(session())
                 }
                 paramStore =
                     ParameterStore(
@@ -536,14 +536,14 @@ class StatsigClient : LifecycleEventListener {
 
     private fun getFeatureGateEvaluation(gateName: String): FeatureGate {
         val gate = db.read("get_value", mapOf("kind" to "gate", "name" to gateName)) {
-            it.first().toFeatureGate()
+            it.first().toFeatureGate(gateName, session())
         }
         return onDeviceEvalAdapter?.getGate(gate, user) ?: gate
     }
 
     private fun getDynamicConfigEvaluation(configName: String): DynamicConfig {
         val config = db.read("get_value", mapOf("kind" to "config", "name" to configName)) {
-            it.first().toDynamicConfig()
+            it.first().toDynamicConfig(configName, session())
         }
         return onDeviceEvalAdapter?.getDynamicConfig(config, user) ?: config
     }
@@ -555,7 +555,7 @@ class StatsigClient : LifecycleEventListener {
         val experiment = db.read(
             "get_experiment",
             mapOf("name" to experimentName, "kind" to "config", "keep" to keepDeviceValue)
-        ) { it.first().toDynamicConfig() }
+        ) { it.first().toDynamicConfig(experimentName, session()) }
         return onDeviceEvalAdapter?.getDynamicConfig(experiment, user) ?: experiment
     }
 
@@ -573,7 +573,7 @@ class StatsigClient : LifecycleEventListener {
                 "keep" to keepDeviceValue,
                 "logs" to (client != null)
             )
-        ) { it.first().toLayer(client) }
+        ) { it.first().toLayer(client, layerName, session()) }
         return onDeviceEvalAdapter?.getLayer(client, layer, user) ?: layer
     }
 
@@ -755,7 +755,8 @@ class StatsigClient : LifecycleEventListener {
     fun manuallyLogGateExposure(gateName: String) =
         manualExposure("logManualGateExposure", gateName) {
             logGateExposure(
-                db.one("get_value", mapOf("kind" to "gate", "name" to gateName))!!.toFeatureGate(),
+                db.one("get_value", mapOf("kind" to "gate", "name" to gateName))!!
+                    .toFeatureGate(gateName, session()),
                 isManual = true
             )
         }
@@ -766,7 +767,7 @@ class StatsigClient : LifecycleEventListener {
                 db.one(
                     "get_value",
                     mapOf("kind" to "config", "name" to configName)
-                )!!.toDynamicConfig(),
+                )!!.toDynamicConfig(configName, session()),
                 isManual = true
             )
         }
@@ -776,7 +777,7 @@ class StatsigClient : LifecycleEventListener {
             val experiment = db.one(
                 "get_experiment",
                 mapOf("name" to configName, "kind" to "config", "keep" to keepDeviceValue)
-            )!!.toDynamicConfig()
+            )!!.toDynamicConfig(configName, session())
             logConfigExposure(experiment, isManual = true)
         }
 
@@ -788,7 +789,7 @@ class StatsigClient : LifecycleEventListener {
         val layer = db.one(
             "get_experiment",
             mapOf("name" to layerName, "kind" to "layer", "keep" to keepDeviceValue)
-        )!!.toLayer(null)
+        )!!.toLayer(null, layerName, session())
         queueLayerExposure(layer, parameterName, isManual = true)
     }
 
@@ -1196,6 +1197,9 @@ class StatsigClient : LifecycleEventListener {
     private fun userJson(): String = gson.toJson(user)
 
     private fun scopedCacheKey(): String = options.customCacheKey(sdkKey, user)
+
+    /** The session-wide evaluation details (and more), cached until the values change. */
+    private fun session(): Row = db.one("session_state")!!
 
     private fun globalEvalDetails(reason: EvalReason? = null): EvalDetails =
         db.one("session_state")!!.evalDetails().apply { this.reason = reason }

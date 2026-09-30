@@ -36,19 +36,24 @@ internal fun jsonParamStore(json: String?): Map<String, Map<String, Any>> =
 internal fun toJson(value: Any?): String? = value?.let { gson.toJson(it) }
 
 /** EvalDetails from the source/reason/lcut/received_at columns. */
-internal fun Row.evalDetails(): EvalDetails = EvalDetails(
-    source = EvalSource.valueOf(string("source")!!),
+internal fun Row.evalDetails(): EvalDetails = evalDetails(this)
+
+/** EvalDetails of a looked-up value: this row's reason, [session]'s (session_state) the rest. */
+internal fun Row.evalDetails(session: Row): EvalDetails = EvalDetails(
+    source = EvalSource.valueOf(session.string("source")!!),
     reason = string("reason")?.let { EvalReason.valueOf(it) },
-    lcut = long("lcut"),
-    receivedAt = long("received_at")
+    lcut = session.long("lcut"),
+    receivedAt = session.long("received_at")
 )
 
-internal fun Row.toFeatureGate(): FeatureGate {
-    val name = string("name")!!
-    val details = evalDetails()
+internal fun Row.toFeatureGate(name: String, session: Row): FeatureGate {
+    val details = evalDetails(session)
     return when {
         bool("overridden") -> FeatureGate(name, details, string("value") == "true", "override")
-        !bool("found") -> FeatureGate(name, details, false)
+            .also { it.secondaryExposuresJson = "[]" }
+        !bool("found") -> FeatureGate(name, details, false).also {
+            it.secondaryExposuresJson = "[]"
+        }
         else -> FeatureGate(
             name,
             details,
@@ -61,12 +66,12 @@ internal fun Row.toFeatureGate(): FeatureGate {
     }
 }
 
-internal fun Row.toDynamicConfig(): DynamicConfig {
-    val name = string("name")!!
-    val details = evalDetails()
+internal fun Row.toDynamicConfig(name: String, session: Row): DynamicConfig {
+    val details = evalDetails(session)
     return when {
         bool("overridden") -> DynamicConfig(name, details, jsonObject(string("value")), "override")
-        !bool("found") -> DynamicConfig(name, details)
+            .also { it.secondaryExposuresJson = "[]" }
+        !bool("found") -> DynamicConfig(name, details).also { it.secondaryExposuresJson = "[]" }
         else -> DynamicConfig(
             name,
             details,
@@ -83,9 +88,8 @@ internal fun Row.toDynamicConfig(): DynamicConfig {
     }
 }
 
-internal fun Row.toLayer(client: StatsigClient?): Layer {
-    val name = string("name")!!
-    val details = evalDetails()
+internal fun Row.toLayer(client: StatsigClient?, name: String, session: Row): Layer {
+    val details = evalDetails(session)
     return when {
         bool("overridden") -> Layer(null, name, details, jsonObject(string("value")), "override")
         !bool("found") -> Layer(client, name, details)

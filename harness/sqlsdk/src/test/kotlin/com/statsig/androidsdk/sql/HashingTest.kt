@@ -72,4 +72,24 @@ class HashingTest {
         }
         assertEquals(0L, db.one("get_value", mapOf("kind" to "gate", "name" to "not a gate"))!!["found"])
     }
+
+    @Test
+    fun get_value_finds_sha256_hashed_names_declared_or_implied() {
+        for (hashUsed in listOf(""","hash_used":"sha256"""", "")) {
+            val db = newDb()
+            db.startSession()
+            val names = inputs().filter { it.isNotEmpty() }.distinct().take(20)
+            val gates = names.joinToString(",") { name ->
+                val hash = Base64.getEncoder().encodeToString(sha256(name))
+                "\"$hash\":{\"name\":\"$hash\",\"value\":true,\"rule_id\":\"r\"}"
+            }
+            db.run("save_values", mapOf(
+                "payload" to """{"feature_gates":{$gates},"dynamic_configs":{},"layer_configs":{},"has_updates":true,"time":1$hashUsed}""",
+                "user" to """{"userID":"u1"}""", "scoped_key" to "u1:client-key"))
+            for (name in names) {
+                assertEquals(name, 1L, db.one("get_value", mapOf("kind" to "gate", "name" to name))!!["found"])
+            }
+            assertEquals(0L, db.one("get_value", mapOf("kind" to "gate", "name" to "not a gate"))!!["found"])
+        }
+    }
 }

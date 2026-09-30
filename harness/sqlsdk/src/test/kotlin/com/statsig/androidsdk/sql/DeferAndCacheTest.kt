@@ -85,4 +85,36 @@ class DeferAndCacheTest {
         db.drainDeferred()
         assertEquals(3L, db.scalar("SELECT count(*) FROM event_queue"))
     }
+
+    @Test
+    fun events_are_valid_json_without_null_members() {
+        val db = db()
+        for (manual in listOf(false, true)) {
+            // (manual exposures dedupe with automatic ones: distinct names per round)
+            db.run("log_gate_exposure", mapOf("name" to "g\"q$manual", "value" to true, "rule_id" to null,
+                "secondary" to null, "reason" to "Network:Recognized", "lcut" to null,
+                "received_at" to 2L, "manual" to manual))
+            for (passed in listOf(null, true, false)) {
+                db.run("log_config_exposure", mapOf("name" to "c$manual", "rule_id" to "r$passed",
+                    "secondary" to "[]", "reason" to "Network:Recognized", "lcut" to 1L,
+                    "received_at" to 2L, "rule_passed" to passed, "manual" to manual))
+            }
+            db.run("log_layer_exposure", mapOf("name" to "l$manual", "rule_id" to "r", "parameter" to "p",
+                "explicit" to "[\"p\"]", "allocated" to null, "secondary" to "[]",
+                "undelegated" to null, "reason" to "Network:Recognized", "received_at" to null,
+                "manual" to manual))
+        }
+        db.run("log_event", mapOf("event_name" to "e", "value" to null, "metadata" to """{"k":"v"}""",
+            "statsig_metadata" to null))
+        db.drainDeferred()
+        assertEquals(11L, db.scalar("SELECT count(*) FROM event_queue"))
+        assertEquals(0L, db.scalar("SELECT count(*) FROM event_queue WHERE NOT json_valid(event)"))
+        assertEquals(0L, db.scalar(
+            "SELECT count(*) FROM event_queue, json_tree(event) WHERE json_tree.type = 'null' " +
+                "AND json_tree.fullkey NOT LIKE '%ruleID' AND json_tree.fullkey NOT LIKE '%lcut'"))
+        assertEquals("g\"qfalse", db.scalar("SELECT event ->> '$.metadata.gate' FROM event_queue ORDER BY id LIMIT 1"))
+        assertEquals(null, db.scalar("SELECT event -> '$.metadata.rulePassed' FROM event_queue WHERE event ->> '$.metadata.ruleID' = 'rnull' LIMIT 1"))
+        assertEquals("false", db.scalar("SELECT event ->> '$.metadata.rulePassed' FROM event_queue WHERE event ->> '$.metadata.ruleID' = 'rfalse' LIMIT 1"))
+        assertEquals(5L, db.scalar("SELECT count(*) FROM event_queue WHERE event ->> '$.metadata.isManualExposure' = 'true'"))
+    }
 }

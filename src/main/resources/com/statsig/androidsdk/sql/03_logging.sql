@@ -61,24 +61,23 @@ CREATE TEMP TABLE IF NOT EXISTS batch (
 -- consecutive calls of the block. Each call also gets :time (when it was made) and, for
 -- @coalesce blocks, :repeat (how many identical calls it stands for). They return whether the
 -- queue is due for a flush (50 events).
+--
+-- Events are written as JSON text directly: every piece is either a JSON value made by SQLite
+-- or the host (user, metadata, exposures) or a string passed through json_quote. Members that
+-- would be null are left out, as the original's Gson did.
 
 -- name: log_event
 -- @defer
 -- @reads: values
 -- @writes: events
--- Custom events. value / metadata / statsig_metadata are JSON (or null). Null members are
--- dropped, as the original's Gson did (json_remove of '$._' removes nothing).
+-- Custom events. value / metadata / statsig_metadata are JSON (or null).
 INSERT INTO event_queue (event)
-  SELECT json_remove(json_object(
-      'eventName', :event_name,
-      'value', json(:value),
-      'metadata', json(:metadata),
-      'user', json(s.logging_user),
-      'time', :time,
-      'statsigMetadata', json(:statsig_metadata)),
-    CASE WHEN :value IS NULL THEN '$.value' ELSE '$._' END,
-    CASE WHEN :metadata IS NULL THEN '$.metadata' ELSE '$._' END,
-    CASE WHEN :statsig_metadata IS NULL THEN '$.statsigMetadata' ELSE '$._' END)
+  SELECT '{"eventName":' || json_quote(:event_name)
+    || coalesce(',"value":' || json(:value), '')
+    || coalesce(',"metadata":' || json(:metadata), '')
+    || ',"user":' || s.logging_user
+    || ',"time":' || :time
+    || coalesce(',"statsigMetadata":' || json(:statsig_metadata), '') || '}'
   FROM session AS s;
 DELETE FROM event_queue WHERE id <= (SELECT max(id) FROM event_queue) - 1000;
 SELECT count(*) >= 50 AS should_flush FROM event_queue;
@@ -88,8 +87,7 @@ SELECT count(*) >= 50 AS should_flush FROM event_queue;
 -- only checks that and notes the exposure in exposure_call (so a repeated exposure costs one
 -- index lookup); the events are then built for all noted calls at once. Hence @quiet: once a
 -- call has logged, identical calls change nothing for 10 minutes unless the user (session,
--- exposure_seen: domain `values`) changes. Members that may be null are removed, as the
--- original's Gson dropped them.
+-- exposure_seen: domain `values`) changes.
 
 -- name: log_gate_exposure
 -- @defer
@@ -106,22 +104,17 @@ INSERT OR IGNORE INTO exposure_call
   WHERE NOT EXISTS (SELECT 1 FROM exposure_seen AS e
                     WHERE e.dedupe_key = k.dedupe_key AND e.logged_at > :time - 600000);
 INSERT INTO event_queue (event)
-  SELECT json_remove(json_object(
-      'eventName', 'statsig::gate_exposure',
-      'user', json(s.logging_user),
-      'time', c.time,
-      'metadata', json_object(
-        'gate', c.name,
-        'gateValue', CASE WHEN c.value THEN 'true' ELSE 'false' END,
-        'ruleID', c.rule_id,
-        'reason', c.reason,
-        'time', coalesce(CAST(c.received_at AS TEXT), 'null'),
-        'lcut', coalesce(CAST(c.lcut AS TEXT), 'null'),
-        'bootstrapMetadata', json(s.bootstrap_metadata),
-        'isManualExposure', CASE WHEN c.manual THEN 'true' END),
-      'secondaryExposures', json(coalesce(c.secondary, '[]'))),
-    CASE WHEN s.bootstrap_metadata IS NULL THEN '$.metadata.bootstrapMetadata' ELSE '$._' END,
-    CASE WHEN c.manual THEN '$._' ELSE '$.metadata.isManualExposure' END)
+  SELECT '{"eventName":"statsig::gate_exposure","user":' || s.logging_user
+    || ',"time":' || c.time
+    || ',"metadata":{"gate":' || json_quote(c.name)
+    || ',"gateValue":' || CASE WHEN c.value THEN '"true"' ELSE '"false"' END
+    || ',"ruleID":' || json_quote(c.rule_id)
+    || ',"reason":' || json_quote(c.reason)
+    || ',"time":' || json_quote(coalesce(CAST(c.received_at AS TEXT), 'null'))
+    || ',"lcut":' || json_quote(coalesce(CAST(c.lcut AS TEXT), 'null'))
+    || coalesce(',"bootstrapMetadata":' || s.bootstrap_metadata, '')
+    || CASE WHEN c.manual THEN ',"isManualExposure":"true"' ELSE '' END
+    || '},"secondaryExposures":' || json(coalesce(c.secondary, '[]')) || '}'
   FROM exposure_call AS c, session AS s
   ORDER BY c.rowid;
 INSERT OR REPLACE INTO exposure_seen (dedupe_key, logged_at)
@@ -146,23 +139,18 @@ INSERT OR IGNORE INTO exposure_call
   WHERE NOT EXISTS (SELECT 1 FROM exposure_seen AS e
                     WHERE e.dedupe_key = k.dedupe_key AND e.logged_at > :time - 600000);
 INSERT INTO event_queue (event)
-  SELECT json_remove(json_object(
-      'eventName', 'statsig::config_exposure',
-      'user', json(s.logging_user),
-      'time', c.time,
-      'metadata', json_object(
-        'config', c.name,
-        'ruleID', c.rule_id,
-        'reason', c.reason,
-        'time', coalesce(CAST(c.received_at AS TEXT), 'null'),
-        'lcut', coalesce(CAST(c.lcut AS TEXT), 'null'),
-        'bootstrapMetadata', json(s.bootstrap_metadata),
-        'rulePassed', CASE c.rule_passed WHEN 1 THEN 'true' WHEN 0 THEN 'false' END,
-        'isManualExposure', CASE WHEN c.manual THEN 'true' END),
-      'secondaryExposures', json(coalesce(c.secondary, '[]'))),
-    CASE WHEN c.rule_passed IS NULL THEN '$.metadata.rulePassed' ELSE '$._' END,
-    CASE WHEN s.bootstrap_metadata IS NULL THEN '$.metadata.bootstrapMetadata' ELSE '$._' END,
-    CASE WHEN c.manual THEN '$._' ELSE '$.metadata.isManualExposure' END)
+  SELECT '{"eventName":"statsig::config_exposure","user":' || s.logging_user
+    || ',"time":' || c.time
+    || ',"metadata":{"config":' || json_quote(c.name)
+    || ',"ruleID":' || json_quote(c.rule_id)
+    || ',"reason":' || json_quote(c.reason)
+    || ',"time":' || json_quote(coalesce(CAST(c.received_at AS TEXT), 'null'))
+    || ',"lcut":' || json_quote(coalesce(CAST(c.lcut AS TEXT), 'null'))
+    || coalesce(',"bootstrapMetadata":' || s.bootstrap_metadata, '')
+    || CASE c.rule_passed WHEN 1 THEN ',"rulePassed":"true"' WHEN 0 THEN ',"rulePassed":"false"'
+         ELSE '' END
+    || CASE WHEN c.manual THEN ',"isManualExposure":"true"' ELSE '' END
+    || '},"secondaryExposures":' || json(coalesce(c.secondary, '[]')) || '}'
   FROM exposure_call AS c, session AS s
   ORDER BY c.rowid;
 INSERT OR REPLACE INTO exposure_seen (dedupe_key, logged_at)
@@ -195,24 +183,19 @@ INSERT OR IGNORE INTO exposure_call
   WHERE NOT EXISTS (SELECT 1 FROM exposure_seen AS e
                     WHERE e.dedupe_key = k.dedupe_key AND e.logged_at > :time - 600000);
 INSERT INTO event_queue (event)
-  SELECT json_remove(json_object(
-      'eventName', 'statsig::layer_exposure',
-      'user', json(s.logging_user),
-      'time', c.time,
-      'metadata', json_object(
-        'config', c.name,
-        'ruleID', c.rule_id,
-        'allocatedExperiment', c.allocated,
-        'parameterName', c.parameter,
-        'isExplicitParameter', CASE WHEN c.is_explicit THEN 'true' ELSE 'false' END,
-        'reason', c.reason,
-        'time', coalesce(CAST(c.received_at AS TEXT), 'null'),
-        'bootstrapMetadata', json(s.bootstrap_metadata),
-        'isManualExposure', CASE WHEN c.manual THEN 'true' END),
-      'secondaryExposures', json(CASE WHEN c.is_explicit
-        THEN coalesce(c.secondary, '[]') ELSE coalesce(c.undelegated, '[]') END)),
-    CASE WHEN s.bootstrap_metadata IS NULL THEN '$.metadata.bootstrapMetadata' ELSE '$._' END,
-    CASE WHEN c.manual THEN '$._' ELSE '$.metadata.isManualExposure' END)
+  SELECT '{"eventName":"statsig::layer_exposure","user":' || s.logging_user
+    || ',"time":' || c.time
+    || ',"metadata":{"config":' || json_quote(c.name)
+    || ',"ruleID":' || json_quote(c.rule_id)
+    || ',"allocatedExperiment":' || json_quote(c.allocated)
+    || ',"parameterName":' || json_quote(c.parameter)
+    || ',"isExplicitParameter":' || CASE WHEN c.is_explicit THEN '"true"' ELSE '"false"' END
+    || ',"reason":' || json_quote(c.reason)
+    || ',"time":' || json_quote(coalesce(CAST(c.received_at AS TEXT), 'null'))
+    || coalesce(',"bootstrapMetadata":' || s.bootstrap_metadata, '')
+    || CASE WHEN c.manual THEN ',"isManualExposure":"true"' ELSE '' END
+    || '},"secondaryExposures":' || json(CASE WHEN c.is_explicit
+      THEN coalesce(c.secondary, '[]') ELSE coalesce(c.undelegated, '[]') END) || '}'
   FROM exposure_call AS c, session AS s
   ORDER BY c.rowid;
 INSERT OR REPLACE INTO exposure_seen (dedupe_key, logged_at)

@@ -13,6 +13,9 @@ import java.util.concurrent.ConcurrentHashMap
  * - calls to `@defer` blocks are queued (identical `@coalesce` calls merged) and run in bulk when
  *   [DEFER_LIMIT] calls are waiting, or before any block that depends on them;
  * - calls to `@quiet` blocks that are known to change nothing are skipped.
+ *
+ * A result row may ask for a block to run first: its `_then` column names a block that is run
+ * with the same parameters, after which the block is run once more.
  */
 internal class StatsigDb(
     private val driver: SqlDriver,
@@ -57,6 +60,7 @@ internal class StatsigDb(
 
     /** Queued calls in call order, and the coalescable ones by (block, params). */
     private val deferred = ArrayList<Deferred>()
+    private val deferredBlocks = HashSet<SqlScript.Block>()
     private val coalesced = HashMap<Key, Deferred>()
 
     /** Called when a bulk run of deferred blocks reports `should_flush`. */
@@ -107,7 +111,12 @@ internal class StatsigDb(
         val result = synchronized(this) {
             check(!closed) { "Statsig database is closed" }
             if (deferred.isNotEmpty() && dependsOnDeferred(block)) flush = drain()
-            val rows = execute(block, params)
+            var rows = execute(block, params)
+            val then = rows.firstOrNull()?.get("_then") as String?
+            if (then != null) {
+                execute(script.block(then), params)
+                rows = execute(block, params)
+            }
             val cacheable = key != null && rows.firstOrNull()?.get("_cacheable").let {
                 it == null || it != 0L
             }
@@ -162,6 +171,7 @@ internal class StatsigDb(
                 call["repeat"] = 1
                 val entry = Deferred(block, key, call)
                 deferred.add(entry)
+                deferredBlocks.add(block)
                 if (block.coalesce) coalesced[key!!] = entry
             }
             deferred.size >= DEFER_LIMIT && drain()
@@ -170,9 +180,8 @@ internal class StatsigDb(
     }
 
     /** Whether [block] reads what queued calls write, or writes what they read or write. */
-    private fun dependsOnDeferred(block: SqlScript.Block): Boolean = deferred.any { d ->
-        block.reads.any { it in d.block.writes } ||
-            block.writes.any { it in d.block.reads || it in d.block.writes }
+    private fun dependsOnDeferred(block: SqlScript.Block): Boolean = deferredBlocks.any { d ->
+        block.reads.any { it in d.writes } || block.writes.any { it in d.reads || it in d.writes }
     }
 
     /**
@@ -185,6 +194,7 @@ internal class StatsigDb(
     private fun drain(): Boolean {
         val calls = ArrayList(deferred)
         deferred.clear()
+        deferredBlocks.clear()
         coalesced.clear()
         val quiet = ArrayList<Deferred>()
         var failure: Throwable? = null

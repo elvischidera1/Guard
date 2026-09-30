@@ -1,7 +1,8 @@
 """Generates the SHA-256 CTE of src/main/resources/com/statsig/androidsdk/sql/01_hashing.sql.
 
 Prints the WITH RECURSIVE ... sha256_state part of the sha256_output view. XOR is written
-arithmetically because SQLite has no XOR operator.
+arithmetically because SQLite has no XOR operator. The get_value block (02_values.sql) carries a
+copy of the view's CTEs over :name instead of hash_input: keep the two in sync.
 """
 K = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
      0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,

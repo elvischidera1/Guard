@@ -30,15 +30,18 @@ class StateTest {
         }
         assertEquals(10L, db.scalar("SELECT count(*) FROM cache_key_map"))
         assertEquals(10L, db.scalar("SELECT count(*) FROM cached_values"))
+        assertEquals(10L, db.scalar("SELECT count(DISTINCT cache_key) FROM cached_entity"))
+        assertEquals(0L, db.scalar("SELECT count(*) FROM cached_entity WHERE cache_key NOT IN (SELECT cache_key FROM cached_values)"))
         assertEquals(10L, db.scalar("SELECT count(*) FROM sticky_value"))
         assertEquals(0L, db.scalar("SELECT count(*) FROM cache_key_map WHERE scoped_key IN ('u1:client-key', 'u2:client-key')"))
 
         // a returning user gets its cached values back
         db.run("set_user", mapOf("user" to """{"userID":"u5"}""", "scoped_key" to "u5:client-key"))
         db.run("load_cache")
-        val gate = db.one("get_value", mapOf("kind" to "gate", "name" to "g"))!!
-        assertEquals("Cache", gate["source"])
-        assertEquals(5L, gate["lcut"])
+        assertEquals(1L, db.one("get_value", mapOf("kind" to "gate", "name" to "g"))!!["found"])
+        val session = db.one("session_state")!!
+        assertEquals("Cache", session["source"])
+        assertEquals(5L, session["lcut"])
     }
 
     @Test

@@ -36,12 +36,22 @@ CREATE TABLE IF NOT EXISTS setting (
   value TEXT
 );
 
--- Initialize responses, one per (user, SDK key). `payload` is the response as received.
+-- Initialize responses, one per (user, SDK key), stored as applied (so that loading them parses
+-- nothing): the response's header fields (values_work.header) here, its entities in
+-- cached_entity.
 CREATE TABLE IF NOT EXISTS cached_values (
   cache_key TEXT PRIMARY KEY,        -- '<user hash>:<sdk key>'
   user_hash TEXT NOT NULL,
-  payload TEXT NOT NULL,
+  header TEXT NOT NULL,              -- JSON array, see values_work.header
   received_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS cached_entity (
+  cache_key TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  name TEXT NOT NULL,
+  body TEXT NOT NULL,                -- as in entity_body
+  PRIMARY KEY (cache_key, kind, name)
 );
 
 -- Custom cache key (StatsigOptions.customCacheKey) -> cache_key. The 10 most recently used

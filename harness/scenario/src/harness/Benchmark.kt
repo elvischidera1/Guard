@@ -20,7 +20,11 @@ object Bench {
     private const val ROUNDS = 7
     val results = LinkedHashMap<String, Map<String, Any>>()
 
+    /** -Dbench.only=<text>: only measure cases whose name contains it (setup still runs). */
+    val only: String? = System.getProperty("bench.only")
+
     inline fun measure(name: String, opsPerRound: Int, warmupRounds: Int = 3, crossinline body: (round: Int) -> Unit) {
+        if (only != null && !name.contains(only)) return
         repeat(warmupRounds) { body(-1 - it) }
         val perOp = (0 until 7).map { round ->
             val start = System.nanoTime()
