@@ -7,7 +7,10 @@ import java.sql.Types
 
 /** [SqlDriver] for the JVM (xerial sqlite-jdbc), used by the harness in place of Android's SQLite. */
 internal class JdbcSqlDriver(path: String) : SqlDriver {
-    private val connection: Connection = DriverManager.getConnection("jdbc:sqlite:$path")
+    // get_generated_keys=false: otherwise sqlite-jdbc runs "SELECT last_insert_rowid()" after
+    // every INSERT, which the SDK never needs.
+    private val connection: Connection =
+        DriverManager.getConnection("jdbc:sqlite:$path?jdbc.get_generated_keys=false")
     private val statements = HashMap<String, PreparedStatement>()
     private val columns = HashMap<String, List<String>>()
 
@@ -34,19 +37,12 @@ internal class JdbcSqlDriver(path: String) : SqlDriver {
         }
     }
 
-    override fun beginTransaction() {
-        connection.autoCommit = false
-    }
+    // Plain SQL (cached statements) rather than setAutoCommit(), which re-prepares each time.
+    override fun beginTransaction() = execute("BEGIN", emptyList())
 
-    override fun commit() {
-        connection.commit()
-        connection.autoCommit = true
-    }
+    override fun commit() = execute("COMMIT", emptyList())
 
-    override fun rollback() {
-        connection.rollback()
-        connection.autoCommit = true
-    }
+    override fun rollback() = execute("ROLLBACK", emptyList())
 
     override fun close() {
         statements.values.forEach { it.close() }

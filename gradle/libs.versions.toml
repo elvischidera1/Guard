@@ -3,8 +3,6 @@ androidGradlePlugin = "8.13.0"
 gradleKtlint = "13.1.0"
 gradleNexusPublish = "2.0.0"
 kotlin = "1.9.25"
-appCompat = "1.7.1"
-coreKtx = "1.9.0"
 gson = "2.13.2"
 junit = "4.13.2"
 kotlinxCoroutines = "1.8.0"
@@ -15,12 +13,10 @@ slf4jSimple = "2.0.17"
 truth = "1.4.5"
 wiremock = "3.0.1"
 ktor = "3.0.0"
-annotationExperimental = "1.5.1"
-datastore = "1.2.1"
+annotation = "1.9.1"
 
 [libraries]
-appcompat = { module = "androidx.appcompat:appcompat", version.ref = "appCompat" }
-core-ktx = { module = "androidx.core:core-ktx", version.ref = "coreKtx" }
+annotation = { module = "androidx.annotation:annotation", version.ref = "annotation" }
 gson = { module = "com.google.code.gson:gson", version.ref = "gson" }
 junit = { module = "junit:junit", version.ref = "junit" }
 kotlin-stdlib = { module = "org.jetbrains.kotlin:kotlin-stdlib", version.ref = "kotlin" }
@@ -36,9 +32,6 @@ robolectric = { module = "org.robolectric:robolectric", version.ref = "robolectr
 slf4j-simple = { module = "org.slf4j:slf4j-simple", version.ref = "slf4jSimple" }
 truth = { module = "com.google.truth:truth", version.ref = "truth" }
 wiremock = { module = "com.github.tomakehurst:wiremock", version.ref = "wiremock" }
-annotation-experimental = { group = "androidx.annotation", name = "annotation-experimental", version.ref = "annotationExperimental" }
-datastore-preferences = { group = "androidx.datastore", name = "datastore-preferences", version.ref = "datastore" }
-datastore-core = { group = "androidx.datastore", name = "datastore-core", version.ref = "datastore" }
 
 [plugins]
 kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin"}

@@ -104,6 +104,31 @@ CREATE TEMP TABLE IF NOT EXISTS eval_result (
   PRIMARY KEY (kind, name)
 );
 
+-- What an evaluation needs per rule and per condition, worked out once by eval_begin.
+CREATE TEMP TABLE IF NOT EXISTS eval_rule_ctx (
+  kind TEXT NOT NULL,
+  spec_name TEXT NOT NULL,
+  idx INTEGER NOT NULL,
+  bucket_input TEXT NOT NULL,        -- '<spec salt>.<rule salt>.<unit id>' (pass percentage)
+  PRIMARY KEY (kind, spec_name, idx)
+);
+
+CREATE TEMP TABLE IF NOT EXISTS eval_cond_ctx (
+  kind TEXT NOT NULL,
+  spec_name TEXT NOT NULL,
+  rule_idx INTEGER NOT NULL,
+  idx INTEGER NOT NULL,
+  type TEXT,
+  operator TEXT,
+  field TEXT,
+  target TEXT,
+  ref_gate TEXT,
+  path TEXT,                         -- JSON path of the user attribute (user_field & co.)
+  unit_id TEXT,
+  bucket_input TEXT,                 -- '<salt>.<unit id>' (user_bucket)
+  PRIMARY KEY (kind, spec_name, rule_idx, idx)
+);
+
 -- str_matches work for the host (and a memo of its answers).
 CREATE TEMP TABLE IF NOT EXISTS regex_request (
   pattern TEXT NOT NULL,
@@ -112,11 +137,20 @@ CREATE TEMP TABLE IF NOT EXISTS regex_request (
   PRIMARY KEY (pattern, value)
 );
 
--- A user attribute by name, as the evaluator reads it: the well-known fields first, then
--- custom, then privateAttributes (each by exact name, then lower-cased), skipping empty strings.
--- `path` is a JSON path into eval_user.user, or NULL when the value is null.
+-- The needed conditions with what eval_begin stores for them. A user attribute is read like the
+-- original: the well-known fields first, then custom, then privateAttributes (each by exact name,
+-- then lower-cased), skipping empty strings. `path` is a JSON path into the user, NULL for null.
+-- The unit ID is userID, or the customIDs entry for the condition's idType.
 CREATE TEMP VIEW IF NOT EXISTS eval_cond_field AS
-SELECT c.*, u.user, u.now_ms,
+SELECT c.*,
+  CASE WHEN lower(c.id_type) <> 'userid' AND c.id_type <> ''
+      THEN coalesce(json_extract(u.user, '$.customIDs."' || c.id_type || '"'),
+                    json_extract(u.user, '$.customIDs."' || lower(c.id_type) || '"'))
+      ELSE json_extract(u.user, '$.userID') END AS unit_id,
+  CASE WHEN c.type = 'user_bucket' THEN c.salt || '.' || coalesce(CASE WHEN lower(c.id_type) <> 'userid' AND c.id_type <> ''
+        THEN coalesce(json_extract(u.user, '$.customIDs."' || c.id_type || '"'),
+                      json_extract(u.user, '$.customIDs."' || lower(c.id_type) || '"'))
+        ELSE json_extract(u.user, '$.userID') END, '') END AS bucket_input,
   CASE WHEN p2 IS NOT NULL AND coalesce(json_type(u.user, p2), 'null') <> 'null'
          AND NOT (json_type(u.user, p2) = 'text' AND json_extract(u.user, p2) = '') THEN p2
        WHEN json_type(u.user, '$.privateAttributes') = 'object' THEN
@@ -152,35 +186,6 @@ FROM (
     ) AS c, eval_user AS u
   ) AS c, eval_user AS u
 ) AS c, eval_user AS u;
-
--- The unit ID for an idType: userID, or the matching customIDs entry.
-CREATE TEMP VIEW IF NOT EXISTS eval_unit AS
-SELECT d.kind, d.spec_name, d.rule_idx, d.idx, d.id_type,
-  CASE WHEN lower(d.id_type) <> 'userid' AND d.id_type <> ''
-    THEN coalesce(json_extract(u.user, '$.customIDs."' || d.id_type || '"'),
-                  json_extract(u.user, '$.customIDs."' || lower(d.id_type) || '"'))
-    ELSE json_extract(u.user, '$.userID') END AS unit_id
-FROM (
-  -- conditions (idx >= 0) and rules (idx = -1) each have an idType
-  SELECT kind, spec_name, rule_idx, idx, id_type FROM dcs_condition
-  UNION ALL
-  SELECT kind, spec_name, idx, -1, json_extract(rule, '$.idType') FROM dcs_rule
-) AS d
-  JOIN eval_needed AS n ON n.kind = d.kind AND n.name = d.spec_name, eval_user AS u;
-
--- Hash inputs: user_bucket conditions and every rule's pass percentage.
-CREATE TEMP VIEW IF NOT EXISTS eval_bucket_input AS
-SELECT c.kind, c.spec_name, c.rule_idx, c.idx, c.salt || '.' || coalesce(e.unit_id, '') AS input
-FROM dcs_condition AS c
-  JOIN eval_unit AS e ON e.kind = c.kind AND e.spec_name = c.spec_name AND e.rule_idx = c.rule_idx AND e.idx = c.idx
-WHERE c.type = 'user_bucket'
-UNION ALL
-SELECT r.kind, r.spec_name, r.idx, -1,
-  coalesce(json_extract(s.spec, '$.salt'), 'null') || '.'
-  || coalesce(json_extract(r.rule, '$.salt'), json_extract(r.rule, '$.id')) || '.' || coalesce(e.unit_id, '')
-FROM dcs_rule AS r
-  JOIN dcs_spec AS s ON s.kind = r.kind AND s.name = r.spec_name
-  JOIN eval_unit AS e ON e.kind = r.kind AND e.spec_name = r.spec_name AND e.rule_idx = r.idx AND e.idx = -1;
 
 -- Each value condition's left-hand side, as JSON (`v`), plus its string/number/epoch readings,
 -- and the same readings of the target.
@@ -224,7 +229,7 @@ FROM (
         WHEN f.type = 'environment_field' THEN coalesce(
           f.user -> ('$.statsigEnvironment."' || f.field || '"'),
           f.user -> ('$.statsigEnvironment."' || lower(f.field) || '"'))
-        WHEN f.type = 'unit_id' THEN json_quote(e.unit_id)
+        WHEN f.type = 'unit_id' THEN json_quote(f.unit_id)
         WHEN f.type = 'current_time' THEN json_quote(CAST(f.now_ms AS TEXT))
         WHEN f.type = 'user_bucket' THEN CAST(CAST(m.output AS INTEGER) % 1000 AS TEXT)
       END AS v,
@@ -235,13 +240,11 @@ FROM (
           WHEN f.type = 'environment_field' THEN coalesce(
             f.user -> ('$.statsigEnvironment."' || f.field || '"'),
             f.user -> ('$.statsigEnvironment."' || lower(f.field) || '"'))
-          WHEN f.type = 'unit_id' THEN json_quote(e.unit_id)
+          WHEN f.type = 'unit_id' THEN json_quote(f.unit_id)
           WHEN f.type = 'current_time' THEN json_quote(CAST(f.now_ms AS TEXT)) END), 'null')
       END AS vtype
-    FROM eval_cond_field AS f
-      LEFT JOIN eval_unit AS e ON e.kind = f.kind AND e.spec_name = f.spec_name AND e.rule_idx = f.rule_idx AND e.idx = f.idx
-      LEFT JOIN eval_bucket_input AS b ON b.kind = f.kind AND b.spec_name = f.spec_name AND b.rule_idx = f.rule_idx AND b.idx = f.idx
-      LEFT JOIN hash_memo AS m ON m.algo = 'bucket' AND m.input = b.input
+    FROM (SELECT c.*, u.user, u.now_ms FROM eval_cond_ctx AS c, eval_user AS u) AS f
+      LEFT JOIN hash_memo AS m ON m.algo = 'bucket' AND m.input = f.bucket_input
     WHERE f.ref_gate IS NULL
   ) AS x
 ) AS x;
@@ -329,9 +332,29 @@ INSERT INTO eval_result (kind, name, bool, value, rule_id, group_name, secondary
   SELECT n.kind, n.name, 0, NULL, '', NULL, '[]', '[]', 0, 0, NULL, NULL, 0, 1
   FROM eval_needed AS n
   WHERE NOT EXISTS (SELECT 1 FROM dcs_spec AS s WHERE s.kind = n.kind AND s.name = n.name);
+DELETE FROM eval_rule_ctx;
+DELETE FROM eval_cond_ctx;
+INSERT INTO eval_rule_ctx (kind, spec_name, idx, bucket_input)
+  SELECT r.kind, r.spec_name, r.idx,
+    coalesce(json_extract(s.spec, '$.salt'), 'null') || '.'
+    || coalesce(json_extract(r.rule, '$.salt'), json_extract(r.rule, '$.id')) || '.'
+    || coalesce(CASE WHEN lower(json_extract(r.rule, '$.idType')) <> 'userid' AND json_extract(r.rule, '$.idType') <> ''
+         THEN coalesce(json_extract(u.user, '$.customIDs."' || json_extract(r.rule, '$.idType') || '"'),
+                       json_extract(u.user, '$.customIDs."' || lower(json_extract(r.rule, '$.idType')) || '"'))
+         ELSE json_extract(u.user, '$.userID') END, '')
+  FROM eval_needed AS n
+    JOIN dcs_rule AS r ON r.kind = n.kind AND r.spec_name = n.name
+    JOIN dcs_spec AS s ON s.kind = r.kind AND s.name = r.spec_name,
+    eval_user AS u;
+INSERT INTO eval_cond_ctx (kind, spec_name, rule_idx, idx, type, operator, field, target, ref_gate,
+    path, unit_id, bucket_input)
+  SELECT kind, spec_name, rule_idx, idx, type, operator, field, target, ref_gate, path, unit_id, bucket_input
+  FROM eval_cond_field;
 INSERT INTO hash_input (algo, input)
-  SELECT DISTINCT 'bucket', input FROM eval_bucket_input
-  WHERE NOT EXISTS (SELECT 1 FROM hash_memo WHERE algo = 'bucket' AND hash_memo.input = eval_bucket_input.input);
+  SELECT DISTINCT 'bucket', b.input FROM (
+    SELECT bucket_input AS input FROM eval_rule_ctx
+    UNION SELECT bucket_input FROM eval_cond_ctx WHERE bucket_input IS NOT NULL) AS b
+  WHERE NOT EXISTS (SELECT 1 FROM hash_memo AS m WHERE m.algo = 'bucket' AND m.input = b.input);
 INSERT OR IGNORE INTO regex_request (pattern, value)
   SELECT tstr, vstr FROM eval_cond_value
   WHERE operator = 'str_matches' AND type IN ('user_field', 'ip_based', 'ua_based', 'environment_field',
@@ -441,14 +464,37 @@ INSERT INTO eval_cond (kind, spec_name, rule_idx, idx, pass, unsupported, exposu
         'gate', c.ref_gate,
         'gateValue', CASE WHEN r.bool THEN 'true' ELSE 'false' END,
         'ruleID', r.rule_id)) END
-  FROM dcs_condition AS c
-    JOIN eval_needed AS n ON n.kind = c.kind AND n.name = c.spec_name
+  FROM eval_cond_ctx AS c
     JOIN eval_result AS r ON r.kind = 'gate' AND r.name = c.ref_gate
   WHERE c.ref_gate IS NOT NULL
     AND NOT EXISTS (SELECT 1 FROM eval_cond AS x
       WHERE x.kind = c.kind AND x.spec_name = c.spec_name AND x.rule_idx = c.rule_idx AND x.idx = c.idx);
 INSERT INTO eval_result (kind, name, bool, value, rule_id, group_name, secondary, undelegated,
     is_experiment_group, is_active, config_delegate, explicit_parameters, unsupported, unrecognized)
+  WITH
+    -- needed specs not evaluated yet whose conditions and delegates all are
+    ready AS (
+      SELECT n.kind, n.name, sp.spec
+      FROM eval_needed AS n JOIN dcs_spec AS sp ON sp.kind = n.kind AND sp.name = n.name
+      WHERE NOT EXISTS (SELECT 1 FROM eval_result AS r WHERE r.kind = n.kind AND r.name = n.name)
+        AND NOT EXISTS (SELECT 1 FROM eval_cond_ctx AS c
+          WHERE c.kind = n.kind AND c.spec_name = n.name AND NOT EXISTS (
+            SELECT 1 FROM eval_cond AS ec
+            WHERE ec.kind = c.kind AND ec.spec_name = c.spec_name AND ec.rule_idx = c.rule_idx AND ec.idx = c.idx))
+        AND NOT EXISTS (SELECT 1 FROM dcs_edge AS e
+          WHERE e.kind = n.kind AND e.name = n.name AND e.dep_kind = 'config'
+            AND NOT EXISTS (SELECT 1 FROM eval_result AS r WHERE r.kind = 'config' AND r.name = e.dep_name))
+    ),
+    -- per rule: do all its conditions pass, does any hit something unsupported
+    rule_status AS (
+      SELECT r.kind, r.spec_name, r.idx, r.rule,
+        coalesce(min(ec.pass), 1) AS all_pass,
+        coalesce(max(ec.unsupported), 0) AS any_unsupported
+      FROM ready
+        JOIN dcs_rule AS r ON r.kind = ready.kind AND r.spec_name = ready.name
+        LEFT JOIN eval_cond AS ec ON ec.kind = r.kind AND ec.spec_name = r.spec_name AND ec.rule_idx = r.idx
+      GROUP BY r.kind, r.spec_name, r.idx
+    )
   SELECT
     t.kind, t.name,
     CASE WHEN t.outcome = 'delegate' THEN d.bool WHEN t.outcome = 'rule' THEN t.passed ELSE 0 END,
@@ -494,43 +540,23 @@ INSERT INTO eval_result (kind, name, bool, value, rule_id, group_name, secondary
         ELSE 'rule' END AS outcome,
       -- pass percentage: bucket of salt.ruleSalt.unitID
       (SELECT CAST(m.output AS INTEGER) < CAST(json_extract(s.rule, '$.passPercentage') * 100 AS INTEGER)
-       FROM eval_bucket_input AS b JOIN hash_memo AS m ON m.algo = 'bucket' AND m.input = b.input
-       WHERE b.kind = s.kind AND b.spec_name = s.name AND b.rule_idx = s.decisive AND b.idx = -1) AS passed,
+       FROM eval_rule_ctx AS b JOIN hash_memo AS m ON m.algo = 'bucket' AND m.input = b.bucket_input
+       WHERE b.kind = s.kind AND b.spec_name = s.name AND b.idx = s.decisive) AS passed,
       -- exposures of every condition up to and including the decisive rule
       (SELECT json_group_array(json(value)) FROM (
         SELECT x.value FROM eval_cond AS ec, json_each(ec.exposures) AS x
         WHERE ec.kind = s.kind AND ec.spec_name = s.name AND ec.rule_idx <= coalesce(s.decisive, 1e18)
         ORDER BY ec.rule_idx, ec.idx, x.key)) AS exposures
     FROM (
-      SELECT s.*,
-        (SELECT rule FROM dcs_rule WHERE kind = s.kind AND spec_name = s.name AND idx = s.decisive) AS rule,
-        (SELECT json_extract(rule, '$.configDelegate') FROM dcs_rule
-         WHERE kind = s.kind AND spec_name = s.name AND idx = s.decisive) AS delegate
-      FROM (
-        SELECT sp.kind, sp.name, sp.spec,
-          -- the first rule that passes, or that hits an unsupported condition
-          (SELECT r.idx FROM dcs_rule AS r
-           WHERE r.kind = sp.kind AND r.spec_name = sp.name AND (
-             NOT EXISTS (SELECT 1 FROM eval_cond AS ec WHERE ec.kind = r.kind AND ec.spec_name = r.spec_name AND ec.rule_idx = r.idx AND NOT ec.pass)
-             OR EXISTS (SELECT 1 FROM eval_cond AS ec WHERE ec.kind = r.kind AND ec.spec_name = r.spec_name AND ec.rule_idx = r.idx AND ec.unsupported))
-           ORDER BY r.idx LIMIT 1) AS decisive,
-          (SELECT EXISTS (SELECT 1 FROM eval_cond AS ec WHERE ec.kind = r.kind AND ec.spec_name = r.spec_name AND ec.rule_idx = r.idx AND ec.unsupported)
-           FROM dcs_rule AS r
-           WHERE r.kind = sp.kind AND r.spec_name = sp.name AND (
-             NOT EXISTS (SELECT 1 FROM eval_cond AS ec WHERE ec.kind = r.kind AND ec.spec_name = r.spec_name AND ec.rule_idx = r.idx AND NOT ec.pass)
-             OR EXISTS (SELECT 1 FROM eval_cond AS ec WHERE ec.kind = r.kind AND ec.spec_name = r.spec_name AND ec.rule_idx = r.idx AND ec.unsupported))
-           ORDER BY r.idx LIMIT 1) AS decisive_unsupported
-        FROM eval_needed AS n JOIN dcs_spec AS sp ON sp.kind = n.kind AND sp.name = n.name
-        WHERE NOT EXISTS (SELECT 1 FROM eval_result AS r WHERE r.kind = n.kind AND r.name = n.name)
-          -- ready: every condition evaluated, every delegate evaluated
-          AND NOT EXISTS (SELECT 1 FROM dcs_condition AS c
-            WHERE c.kind = n.kind AND c.spec_name = n.name AND NOT EXISTS (
-              SELECT 1 FROM eval_cond AS ec
-              WHERE ec.kind = c.kind AND ec.spec_name = c.spec_name AND ec.rule_idx = c.rule_idx AND ec.idx = c.idx))
-          AND NOT EXISTS (SELECT 1 FROM dcs_edge AS e
-            WHERE e.kind = n.kind AND e.name = n.name AND e.dep_kind = 'config'
-              AND NOT EXISTS (SELECT 1 FROM eval_result AS r WHERE r.kind = 'config' AND r.name = e.dep_name))
-      ) AS s
+      -- the decisive rule: the first that passes, or that hits an unsupported condition
+      SELECT ready.kind, ready.name, ready.spec,
+        rs.idx AS decisive, rs.any_unsupported AS decisive_unsupported, rs.rule,
+        json_extract(rs.rule, '$.configDelegate') AS delegate
+      FROM ready
+        LEFT JOIN (SELECT kind, spec_name, min(idx) AS idx FROM rule_status
+                   WHERE all_pass OR any_unsupported GROUP BY kind, spec_name) AS d
+          ON d.kind = ready.kind AND d.spec_name = ready.name
+        LEFT JOIN rule_status AS rs ON rs.kind = d.kind AND rs.spec_name = d.spec_name AND rs.idx = d.idx
     ) AS s
   ) AS t
     LEFT JOIN eval_result AS d ON d.kind = 'config' AND d.name = t.delegate;
