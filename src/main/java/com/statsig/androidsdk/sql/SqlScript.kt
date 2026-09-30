@@ -34,6 +34,8 @@ internal class SqlScript private constructor(val blocks: Map<String, Block>) {
      * `@coalesce`: queued calls with identical parameters may be merged (`repeat` counts them);
      * `@quiet: <ms>`: after a call that changed rows, identical calls made within <ms> change
      * nothing, as long as nothing the block reads is written in between (so they may be skipped).
+     * `@needs: a, b`: those blocks (e.g. creating objects few connections use) must have run on
+     * the connection first; the host runs each once.
      * Result columns: `_cacheable` = 0 (see `@cache`); `_then` = a block to run with the same
      * parameters before running this block once more.
      */
@@ -45,7 +47,8 @@ internal class SqlScript private constructor(val blocks: Map<String, Block>) {
         val cache: Boolean,
         val defer: Boolean,
         val coalesce: Boolean,
-        val quietMs: Long? = null
+        val quietMs: Long? = null,
+        val needs: List<String> = emptyList()
     ) {
         /** [reads] as a list (iterated on every cached read). */
         val readList: List<String> = reads.toList()
@@ -138,7 +141,8 @@ internal class SqlScript private constructor(val blocks: Map<String, Block>) {
                         "cache" in d,
                         "defer" in d,
                         "coalesce" in d,
-                        d["quiet"]?.trim()?.toLong()
+                        d["quiet"]?.trim()?.toLong(),
+                        set("needs").toList()
                     )
                 }
             )

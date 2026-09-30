@@ -35,6 +35,7 @@ class HashingTest {
     @Test
     fun djb2_sha256_and_buckets_match_the_platform_implementations() {
         val db = newDb()
+        db.run("sha256_schema")
         for (input in inputs()) {
             for (algo in listOf("djb2", "sha256", "bucket")) db.exec("INSERT INTO hash_input (algo, input) VALUES (?, ?)", algo, input)
             val digest = sha256(input)

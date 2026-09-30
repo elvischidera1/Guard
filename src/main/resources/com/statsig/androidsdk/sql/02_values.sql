@@ -441,6 +441,7 @@ FROM session AS s
 
 
 -- name: hash_name
+-- @needs: sha256_schema
 -- Memoizes the hash get_value needs for :name (sha256, or djb2 of names its inline form cannot
 -- take).
 INSERT INTO hash_input (algo, input)
@@ -452,6 +453,7 @@ INSERT INTO hash_input (algo, input)
 
 
 -- name: get_experiment
+-- @needs: sha256_schema
 -- @cache
 -- @reads: values
 -- @writes: values

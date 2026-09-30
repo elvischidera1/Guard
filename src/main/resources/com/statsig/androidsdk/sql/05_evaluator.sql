@@ -10,10 +10,7 @@
 --                  it reports no progress (one round per level of gate nesting),
 --   eval_result    returns the answer.
 
--- name: dcs_load
--- OnDeviceEvalAdapter.setData: replaces the specs (a payload that is not JSON is ignored).
--- The evaluator's tables are created by the first load, so that clients without on-device
--- evaluation never pay for them.
+-- name: schema
 
 CREATE TEMP TABLE IF NOT EXISTS dcs (
   id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -140,6 +137,10 @@ CREATE TEMP TABLE IF NOT EXISTS regex_request (
   PRIMARY KEY (pattern, value)
 );
 
+
+
+-- name: evaluator_views
+-- The evaluator's views: large, so created only on connections that evaluate (@needs).
 -- The needed conditions with what eval_begin stores for them. A user attribute is read like the
 -- original: the well-known fields first, then custom, then privateAttributes (each by exact name,
 -- then lower-cased), skipping empty strings. `path` is a JSON path into the user, NULL for null.
@@ -258,7 +259,8 @@ FROM (
 ) AS x;
 
 
--- Loading the specs.
+-- name: dcs_load
+-- OnDeviceEvalAdapter.setData: replaces the specs (a payload that is not JSON is ignored).
 DELETE FROM dcs WHERE json_valid(:payload);
 DELETE FROM dcs_spec WHERE json_valid(:payload);
 DELETE FROM dcs_rule WHERE json_valid(:payload);
@@ -320,6 +322,7 @@ FROM dcs AS d LEFT JOIN dcs_param_store AS s ON s.name = :name;
 
 
 -- name: eval_begin
+-- @needs: sha256_schema, evaluator_views
 -- Starts evaluating :name (:kind 'gate' | 'config' | 'layer') for :user (JSON).
 DELETE FROM eval_user;
 DELETE FROM eval_needed;
@@ -378,6 +381,7 @@ UPDATE regex_request SET result = :result WHERE pattern = :pattern AND value = :
 
 
 -- name: eval_conditions
+-- @needs: evaluator_views
 -- Every condition that does not reference another gate. Unknown types and operators are
 -- "unsupported": the spec then evaluates to its default value, as in the original.
 INSERT INTO eval_cond (kind, spec_name, rule_idx, idx, pass, unsupported, exposures)
@@ -463,6 +467,7 @@ INSERT INTO eval_cond (kind, spec_name, rule_idx, idx, pass, unsupported, exposu
 
 
 -- name: eval_step
+-- @needs: sha256_schema
 -- One round: gate conditions whose gate is evaluated, then specs whose conditions and delegates
 -- are all evaluated. Returns how much is done, so the host can stop when a round adds nothing.
 INSERT INTO eval_cond (kind, spec_name, rule_idx, idx, pass, unsupported, exposures)

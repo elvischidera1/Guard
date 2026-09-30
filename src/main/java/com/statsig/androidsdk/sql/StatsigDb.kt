@@ -330,7 +330,11 @@ internal class StatsigDb(
         for (domain in block.writes) cache[domain]?.clear()
     }
 
+    /** Blocks named by `@needs` that already ran on this connection. */
+    private val prepared = HashSet<String>()
+
     private fun execute(block: SqlScript.Block, params: Map<String, Any?>): List<Row> {
+        for (need in block.needs) if (prepared.add(need)) execute(script.block(need), emptyMap())
         val statements = block.statements
         // A block with at most one write is atomic by itself; only others need a transaction.
         if (statements.count { !it.returnsRows } <= 1) {

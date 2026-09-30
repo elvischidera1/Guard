@@ -50,10 +50,10 @@ class SqlScriptTest {
     @Test
     fun every_shipped_block_prepares() {
         // Parsing plus running the schema proves every statement in the schema compiles; the
-        // other blocks are prepared here against that schema (plus the evaluator's tables, which
-        // the first dcs_load creates).
+        // other blocks are prepared here against that schema (plus the objects created on demand).
         val db = newDb()
-        db.run("dcs_load", mapOf("payload" to "not json", "received_at" to 0L))
+        db.run("sha256_schema")
+        db.run("evaluator_views")
         val driver = StatsigDb::class.java.getDeclaredField("driver").apply { isAccessible = true }.get(db) as JdbcSqlDriver
         val prepare = JdbcSqlDriver::class.java.getDeclaredField("connection").apply { isAccessible = true }.get(driver) as java.sql.Connection
         for ((name, block) in SqlScript.default.blocks) {
