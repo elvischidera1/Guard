@@ -196,3 +196,7 @@ BEGIN
   INSERT OR IGNORE INTO hash_memo (algo, input, output) SELECT algo, input, output FROM sha256_output;
   DELETE FROM hash_input;
 END;
+
+-- name: reset
+DELETE FROM hash_input;
+DELETE FROM djb2_input;

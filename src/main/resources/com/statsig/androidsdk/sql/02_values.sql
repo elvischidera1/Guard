@@ -574,3 +574,11 @@ INSERT OR IGNORE INTO sticky_value (owner, name_hash, spec)
   WHERE type = 'object';
 INSERT OR REPLACE INTO override (kind, name, value) SELECT kind, name, value FROM local_override;
 INSERT OR REPLACE INTO setting (key, value) VALUES ('legacy_imported', '1');
+
+-- name: reset
+DELETE FROM v2_value;
+DELETE FROM v2_exposure;
+DELETE FROM bootstrap_user_ids;
+DELETE FROM bootstrap_evaluated_ids;
+DELETE FROM values_work;
+DELETE FROM lookup;

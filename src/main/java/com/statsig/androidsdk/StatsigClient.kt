@@ -226,7 +226,8 @@ class StatsigClient : LifecycleEventListener {
                 statsigJob + dispatcherProvider.main + errorBoundary.getExceptionHandler()
             )
 
-        db = StatsigDb(sqlDriverFactory(application))
+        val factory = sqlDriverFactory
+        db = StatsigDb.open(application to factory) { factory(application) }
         db.run(
             "session_start",
             mapOf(

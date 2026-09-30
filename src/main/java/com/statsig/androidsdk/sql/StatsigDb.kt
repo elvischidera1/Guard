@@ -1,6 +1,7 @@
 package com.statsig.androidsdk.sql
 
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLongArray
 
@@ -18,15 +19,50 @@ import java.util.concurrent.atomic.AtomicLongArray
  *
  * A result row may ask for a block to run first: its `_then` column names a block that is run
  * with the same parameters, after which the block is run once more.
+ *
+ * A client opened with [open] hands its connection back when closed: the `reset` block clears the
+ * per-client state and the next client on the same database skips `connect` and `schema`.
  */
-internal class StatsigDb(
-    private val driver: SqlDriver,
-    private val script: SqlScript = SqlScript.default
+internal class StatsigDb private constructor(
+    private val connection: Connection,
+    private val script: SqlScript,
+    private val poolKey: Any?
 ) {
+    constructor(driver: SqlDriver, script: SqlScript = SqlScript.default) :
+        this(Connection(driver), script, null)
+
+    /** An open connection and the once-per-connection blocks (`@needs`) already run on it. */
+    private class Connection(val driver: SqlDriver) {
+        val prepared = HashSet<String>()
+        var fresh = true
+    }
+
     companion object {
         private const val DEFER_LIMIT = 50
         private const val CACHE_LIMIT = 16384
         private const val RAN = -1
+
+        /** The connection last handed back, by its key: one is kept. Guarded by [pool]. */
+        private val pool = HashMap<Any, Connection>()
+
+        /** Closing checkpoints the write-ahead log: done off the caller's thread. */
+        private val closer = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "statsig-db-close").apply { isDaemon = true }
+        }
+
+        /**
+         * Opens a client on the database identified by [key], reusing the connection a closed
+         * client on it handed back, or else one from [driver].
+         */
+        fun open(key: Any, script: SqlScript = SqlScript.default, driver: () -> SqlDriver) =
+            StatsigDb(
+                synchronized(pool) { pool.remove(key to script) } ?: Connection(driver()),
+                script,
+                key to script
+            )
+
+        private fun closeLater(connection: Connection) =
+            closer.execute { runCatching { connection.driver.close() } }
 
         /**
          * A map's hash for the cache keys. Map.hashCode() sums key ^ value per entry, which
@@ -141,9 +177,15 @@ internal class StatsigDb(
     @Volatile
     private var closed = false
 
+    private val driver = connection.driver
+    private val prepared = connection.prepared
+
     init {
-        run("connect")
-        run("schema")
+        if (connection.fresh) {
+            run("connect")
+            run("schema")
+            connection.fresh = false
+        }
     }
 
     fun run(block: String, params: Map<String, Any?> = emptyMap()): List<Row> =
@@ -215,11 +257,20 @@ internal class StatsigDb(
         if (flush) onShouldFlush?.invoke()
     }
 
-    fun close() = synchronized(this) {
-        if (!closed) {
+    fun close() {
+        val reusable = synchronized(this) {
+            if (closed) return
             closed = true
-            driver.close()
+            poolKey != null && runCatching { execute(script.block("reset"), emptyMap()) }.isSuccess
         }
+        if (!reusable) return closeLater(connection)
+        val evicted = synchronized(pool) {
+            val others = pool.values.toList()
+            pool.clear()
+            pool[poolKey!!] = connection
+            others
+        }
+        evicted.forEach(::closeLater)
     }
 
     private fun defer(block: SqlScript.Block, params: Map<String, Any?>) {
@@ -329,9 +380,6 @@ internal class StatsigDb(
         for (id in block.writeIds) generations.incrementAndGet(id)
         for (domain in block.writes) cache[domain]?.clear()
     }
-
-    /** Blocks named by `@needs` that already ran on this connection. */
-    private val prepared = HashSet<String>()
 
     private fun execute(block: SqlScript.Block, params: Map<String, Any?>): List<Row> {
         for (need in block.needs) if (prepared.add(need)) execute(script.block(need), emptyMap())

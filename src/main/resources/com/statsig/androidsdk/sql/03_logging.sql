@@ -299,3 +299,11 @@ FROM (
   ORDER BY created_at DESC, id DESC LIMIT 10)
 ORDER BY created_at, id;
 DELETE FROM failed_log WHERE sdk_key = :sdk_key;
+
+-- name: reset
+DELETE FROM event_queue;
+DELETE FROM exposure_seen;
+DELETE FROM exposure_call;
+DELETE FROM non_exposed;
+DELETE FROM marker;
+DELETE FROM batch;

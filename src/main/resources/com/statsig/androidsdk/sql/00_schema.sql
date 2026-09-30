@@ -23,6 +23,9 @@
 PRAGMA temp_store = MEMORY;
 -- Durable state is a cache: write-ahead logging without a sync per commit (Android's own setting
 -- for WAL databases). A crash can lose the last writes, never corrupt the file.
+-- Switching a new (empty) file to WAL writes its first page; that write is not synced (it holds
+-- no data yet), which makes the switch ~10x faster. An existing WAL database is left as is.
+PRAGMA synchronous = OFF;
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 
@@ -176,3 +179,12 @@ CREATE TEMP TABLE IF NOT EXISTS memory_values (
   payload TEXT NOT NULL,
   bootstrap_metadata TEXT
 );
+
+-- name: reset
+-- Run when a client closes and its connection is kept for the next client on the same database:
+-- drops the per-client state (TEMP tables) so the connection starts like a new one. Tables
+-- that only memoize pure functions (hash_memo, djb2_pow) are kept. Each file clears its own.
+DELETE FROM session;
+DELETE FROM entity_body;
+DELETE FROM override;
+DELETE FROM memory_values;

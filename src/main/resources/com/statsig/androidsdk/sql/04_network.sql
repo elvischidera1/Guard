@@ -102,3 +102,6 @@ INSERT OR REPLACE INTO fallback_url (endpoint, url, previous, expires_at)
     AND c.url IS NOT f.url
   ORDER BY c.key LIMIT 1;
 SELECT changes() AS updated;
+
+-- name: reset
+DELETE FROM dns_cooldown;

@@ -619,3 +619,18 @@ SELECT r.bool, r.value, r.rule_id, r.group_name, r.secondary, r.undelegated,
   NOT EXISTS (SELECT 1 FROM eval_cond_ctx WHERE type = 'current_time') AS cacheable,
   d.time AS lcut, d.received_at
 FROM dcs AS d LEFT JOIN eval_result AS r ON r.kind = :kind AND r.name = :name;
+
+-- name: reset
+DELETE FROM dcs;
+DELETE FROM dcs_spec;
+DELETE FROM dcs_rule;
+DELETE FROM dcs_condition;
+DELETE FROM dcs_edge;
+DELETE FROM dcs_param_store;
+DELETE FROM eval_user;
+DELETE FROM eval_needed;
+DELETE FROM eval_cond;
+DELETE FROM eval_result;
+DELETE FROM eval_rule_ctx;
+DELETE FROM eval_cond_ctx;
+DELETE FROM regex_request;
