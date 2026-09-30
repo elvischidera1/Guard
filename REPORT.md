@@ -14,12 +14,15 @@ left in Kotlin is the public API, the model classes, and the I/O that SQL cannot
   honoring the blocks' directives (caching, batching, skipping known no-ops) makes it fast.
 - **Behavior.** It matches the original SDK: a public-API script of 337 observations gives the same
   results on both SDKs, except one diagnostics event where the original has a bug (fixed here).
-- **Performance.** After a performance pass, every benchmark is within 2× of the original (at
-  most 1.8×), and 11 of the 24 are faster. Repeated reads (`checkGate`, `getConfig`, layers,
-  parameter stores) take 0.3–1.1 µs, as the original's 0.4–0.8 µs; on-device evaluation takes
-  0.6–1.8 µs (the original: 1.5–8 µs); `initialize` takes 1.0–1.8× as long; the most expensive
-  case, a never-seen gate name with a new exposure, takes 1.7×. The first SQL version was up to 240×
-  slower; [below](#benchmark-before-and-after) is what changed.
+- **Performance.** After three performance passes, 18 of the 24 benchmarks are as fast as the
+  original or faster, and the slowest is 1.4×. Repeated reads (`checkGate`, `getConfig`, layers,
+  parameter stores) take 0.15–0.7 µs (the original: 0.4–0.8 µs; parameter stores are 1.2–1.3×,
+  within noise); on-device evaluation 0.4–0.8 µs
+  (1.8–10 µs); `initialize` from a warm cache or offline 0.5–0.9×. Still slower: a fresh install
+  (1.4×: a new database file, its schema and statements), a never-seen gate name with a new
+  exposure (1.4×), a 2,000 + 2,000 entity response over the network (1.2×), and `updateUser` over
+  the network (1.1×). The first SQL
+  version was up to 240× slower; [below](#benchmark-before-and-after) is what changed.
 - **Compatibility.** The SQL needs SQLite 3.38+, which Android ships from API 34 (Android 14). Older
   devices need a bundled SQLite, which `StatsigClient.sqlDriverFactory` lets an app plug in.
 
@@ -203,30 +206,30 @@ code.
 
 | Benchmark (median per operation) | Original | First SQL version | SQL now | Now vs original |
 | --- | ---: | ---: | ---: | ---: |
-| initialize (network, fresh install) | 17.1 ms | 40.8 ms | 26.8 ms | 1.6× |
-| initialize (network, warm cache) | 14.4 ms | 30.1 ms | 24.0 ms | 1.7× |
-| initialize (offline, from cache) | 7.9 ms | 21.9 ms | 14.2 ms | 1.8× |
-| initialize (network, 2000 gates+2000 configs) | 47.8 ms | 148.4 ms | 63.3 ms | 1.3× |
-| initialize (offline, 2000+2000 from cache) | 17.7 ms | 100.8 ms | 16.9 ms | 1.0× |
-| checkGate (hit, deduped exposure) | 461 ns | 44.6 µs | 303 ns | 0.7× |
-| checkGate (miss) | 828 ns | 38.7 µs | 297 ns | 0.4× |
-| checkGateWithExposureLoggingDisabled | 376 ns | 29.7 µs | 363 ns | 1.0× |
-| getConfig + getString | 611 ns | 52.7 µs | 400 ns | 0.7× |
-| getExperiment(keepDeviceValue=true) | 21.4 µs | 86.4 µs | 391 ns | 0.02× |
-| getLayer + getString (param exposure) | 602 ns | 106.3 µs | 478 ns | 0.8× |
-| getParameterStore + getString(static) | 416 ns | 34.5 µs | 483 ns | 1.2× |
-| getParameterStore + getString(gate ref) | 564 ns | 82.3 µs | 827 ns | 1.5× |
-| overridden gate | 479 ns | 38.8 µs | 297 ns | 0.6× |
-| checkGate (unique names -> new exposure each) | 25.6 µs | 194.2 µs | 42.7 µs | 1.7× |
-| logEvent x2000 + flush | 26.1 µs | 173.8 µs | 22.1 µs | 0.8× |
-| updateUser(values) bootstrap switch | 227.1 µs | 222.1 µs | 270.1 µs | 1.2× |
-| updateUser (network) switch between 2 users | 2.4 ms | 3.9 ms | 3.4 ms | 1.4× |
-| checkGate on 2000-gate payload (hit) | 757 ns | 47.1 µs | 812 ns | 1.1× |
-| getConfig on 2000-config payload | 787 ns | 48.2 µs | 1.1 µs | 1.4× |
-| on-device checkGate (public rule) | 1.7 µs | 371.5 µs | 1.1 µs | 0.6× |
-| on-device checkGate (nested pass_gate) | 8.1 µs | 1.1 ms | 654 ns | 0.1× |
-| on-device checkGate (bucketing/sha256) | 1.5 µs | 439.2 µs | 648 ns | 0.4× |
-| on-device getLayer (delegated experiment) | 4.2 µs | 743.4 µs | 1.8 µs | 0.4× |
+| initialize (network, fresh install) | 19.7 ms | 40.8 ms | 28.2 ms | 1.4× |
+| initialize (network, warm cache) | 16.6 ms | 30.1 ms | 14.1 ms | 0.9× |
+| initialize (offline, from cache) | 7.7 ms | 21.9 ms | 5.9 ms | 0.8× |
+| initialize (network, 2000 gates+2000 configs) | 58.0 ms | 148.4 ms | 70.7 ms | 1.2× |
+| initialize (offline, 2000+2000 from cache) | 22.3 ms | 100.8 ms | 11.1 ms | 0.5× |
+| checkGate (hit, deduped exposure) | 535 ns | 44.6 µs | 368 ns | 0.7× |
+| checkGate (miss) | 812 ns | 38.7 µs | 161 ns | 0.2× |
+| checkGateWithExposureLoggingDisabled | 436 ns | 29.7 µs | 288 ns | 0.7× |
+| getConfig + getString | 677 ns | 52.7 µs | 398 ns | 0.6× |
+| getExperiment(keepDeviceValue=true) | 26.4 µs | 86.4 µs | 394 ns | 0.01× |
+| getLayer + getString (param exposure) | 720 ns | 106.3 µs | 520 ns | 0.7× |
+| getParameterStore + getString(static) | 512 ns | 34.5 µs | 590 ns | 1.2× |
+| getParameterStore + getString(gate ref) | 586 ns | 82.3 µs | 739 ns | 1.3× |
+| overridden gate | 552 ns | 38.8 µs | 148 ns | 0.3× |
+| checkGate (unique names -> new exposure each) | 33.7 µs | 194.2 µs | 48.1 µs | 1.4× |
+| logEvent x2000 + flush | 38.7 µs | 173.8 µs | 15.9 µs | 0.4× |
+| updateUser(values) bootstrap switch | 254.8 µs | 222.1 µs | 242.7 µs | 1.0× |
+| updateUser (network) switch between 2 users | 3.6 ms | 3.9 ms | 3.8 ms | 1.1× |
+| checkGate on 2000-gate payload (hit) | 788 ns | 47.1 µs | 389 ns | 0.5× |
+| getConfig on 2000-config payload | 2.1 µs | 48.2 µs | 570 ns | 0.3× |
+| on-device checkGate (public rule) | 1.8 µs | 371.5 µs | 805 ns | 0.5× |
+| on-device checkGate (nested pass_gate) | 10.1 µs | 1.1 ms | 549 ns | 0.05× |
+| on-device checkGate (bucketing/sha256) | 1.8 µs | 439.2 µs | 416 ns | 0.2× |
+| on-device getLayer (delegated experiment) | 4.6 µs | 743.4 µs | 770 ns | 0.2× |
 
 ### What made it fast
 
@@ -281,20 +284,62 @@ original's `HashMap`, or faster.
 - Parameters are bound once per name (`:name` compiles to `?N`).
 - The durable database uses WAL with `synchronous = NORMAL` (Android's own setting for WAL
   databases), so a commit does not fsync. Fallback-URL and compression checks are cached.
-- Connection setup does less: the on-device evaluator's tables are created by the first
-  `dcs_load`, and hashing a user avoids compiling the SHA-256 program.
+- Connection setup does less: schema that only some features use (the SHA-256 program, the
+  evaluator's views) is created on first use (`@needs`), and hashing a user avoids compiling the
+  SHA-256 program.
 - The harness driver talks to SQLite's statement API directly, as Android's binding does. The
   JDBC wrapper cost 2–3 µs per statement plus about 0.5 µs per parameter and column.
 
-**Where the remaining cost is.**
+**4. Setup, one-off work and flushing (third pass).** The third pass went after the cases that
+were still slower than the original:
 
-- *New names* (`checkGate` of a name never seen before, each with a new exposure) are the most
-  expensive case: a lookup and a staged exposure, both real SQLite work, plus events written in
-  bulk. It is under 2×, and it only happens once per name per client.
-- *Initialization* creates a TEMP schema and prepares its statements on a fresh connection, and
-  writes to the file database, which the original's in-memory SharedPreferences did not.
+- *Connections are reused.* A client that shuts down hands its connection back: the `reset`
+  blocks clear the per-client TEMP tables, and the next client on the same database skips
+  `connect` and `schema` and finds its statements compiled. A connection that is not reused is
+  closed (a WAL checkpoint) on a background thread. This made `initialize` from a warm cache or
+  offline faster than the original.
+- *A new file is switched to WAL without a sync.* Its first page holds nothing yet, and the switch
+  went from about 2 ms to 0.2 ms.
+- *No temporary copies of inserted rows.* SQLite copies the rows of an `INSERT ... SELECT` into a
+  temporary table first when the target has triggers (20–40 µs even for one row). The inserts
+  into `values_work` use `VALUES`, and the apply trigger is split per kind of payload (v1, stored
+  as applied, init-v2) so an insert runs only the statements its payload needs.
+- *The bootstrap check compares IDs directly.* The evaluated keys are compared with the user's IDs
+  without scratch tables or `EXCEPT`, only `evaluated_keys` is walked (not the whole payload), and
+  the outcome is kept with the bootstrap values for the same user and payload.
+- *Diagnostics and exposure events are built as text.* Markers and the diagnostics event are
+  concatenated (null members left out) instead of `json_object` + `json_patch`; exposure events
+  are one `printf` each. `take_batch` returns the request body directly instead of copying it
+  through a table.
+- *One background flush at a time.* A full queue starts a flush unless one is running; one asked
+  for meanwhile runs right after it and takes everything queued by then. Before, flushes queued
+  behind a lock held across the HTTP request, so an explicit `flush()` waited for all of them.
+- *The host cache stays out of the way of one-off lookups.* Memoized parameters keep their result
+  in their own slot; the shared map is only used when two reads share parameters, so a stream of
+  never-seen names no longer fills and clears it.
+- *A large response is bound once.* Binding a 1 MB initialize response costs about 2 ms per
+  statement that names it.
+
+**Where the remaining cost is.** The cases still above 1× are bound by work SQLite does that the
+original (whose SharedPreferences are in memory in the harness) does not:
+
+- *Fresh install* (1.4×): a new database file needs its schema (about 60 `CREATE` statements at
+  30–55 µs each inside SQLite) and every statement compiled once, 12–15 ms in all. The connection
+  pool removes this for later clients on the same database, but the benchmark opens a new file
+  each round. Sharing a connection across files (`ATTACH`) does not help: `DETACH` expires every
+  compiled statement.
+- *A never-seen gate name with a new exposure* (1.4×): a lookup (9.5 µs in SQLite, djb2 included)
+  and a staged exposure plus its event (about 6 µs), which the original does with a `HashMap` and a
+  list append. Repeats of a name are hash-map hits.
+- *A 1 MB response over the network* (1.2×): parsing and applying 4,000 entities (about 30 ms) and
+  persisting them as applied (about 15 ms, which makes the offline start 0.5×). A write-behind of
+  the persisted copy would move the latter off `initialize`.
+- *`updateUser` over the network* (1.1×): per switch, about 1.3 ms of SQL (loading the cache,
+  applying and persisting the response, diagnostics) next to a 1.2–1.4 ms request.
+- *Sub-microsecond reads* (parameter stores, 0.6–0.7 µs): within this VM's noise of the original
+  (they measured 0.8–0.9× in other runs).
 - *First use of a statement on a connection* compiles it, e.g. the first lookup of a SHA-256
-  keyed name compiles the SHA-256 program (about 2 ms, once per client).
+  keyed name compiles the SHA-256 program (about 2 ms, once per connection).
 
 ## Behavior differences
 
@@ -334,7 +379,12 @@ original's `HashMap`, or faster.
   starts. Responses for a user the session has left are still ignored.
 - **Durability.** The database uses WAL with `synchronous = NORMAL`: an OS crash or power loss
   can lose the last commits (never corrupt the file). The original's SharedPreferences writes were
-  asynchronous, so they could be lost the same way.
+  asynchronous, so they could be lost the same way. A new, empty file is switched to WAL without
+  syncing its first page.
+- **Log requests during a burst.** While a background flush is in flight, a full queue does not
+  start another one; the next flush takes everything queued by then. A burst of events is sent in
+  fewer, larger requests than the original's one per 50 events. `flush()` still sends everything
+  queued when it is called.
 - **Fallback URLs** are looked up once per client while none is known. One that another client in
   the same process discovers later is not seen by this client until it changes fallback URLs
   itself.
@@ -378,6 +428,9 @@ original's `HashMap`, or faster.
   still be correct, only slower.
 - **Memory.** The host cache holds up to 16,384 results per domain before it is cleared; each is a
   model object (a few hundred bytes).
+- **An idle connection.** After `shutdown()`, the client's connection stays open (its TEMP tables
+  emptied) for the next client on the same database. One is kept per process: when a client on
+  another database shuts down, its connection replaces the idle one, which is closed.
 - **The JVM harness driver** reaches sqlite-jdbc's package-private native methods (from a class
   in its package). It is test infrastructure; the Android driver uses the public framework API.
 

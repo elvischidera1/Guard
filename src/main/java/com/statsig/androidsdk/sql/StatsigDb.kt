@@ -167,7 +167,11 @@ internal class StatsigDb private constructor(
      * last result in their slot, so the map is only needed when that slot is taken by another
      * block or call site (the same parameters read two ways).
      */
-    private fun needsMap(params: Map<String, Any?>, block: SqlScript.Block, tag: Class<*>?): Boolean {
+    private fun needsMap(
+        params: Map<String, Any?>,
+        block: SqlScript.Block,
+        tag: Class<*>?
+    ): Boolean {
         if (params !is Params) return true
         val slot = params.slot ?: return false
         return slot.block !== block || slot.tag !== tag
@@ -377,7 +381,10 @@ internal class StatsigDb private constructor(
             if (needsMap(params, call.block, Quiet::class.java)) {
                 for (domain in call.block.readList) put(domain, call.key, until)
             }
-            if (params is Params) params.slot = Slot(call.block, Quiet::class.java, gens(call.block), until)
+            if (params is Params) {
+                params.slot =
+                    Slot(call.block, Quiet::class.java, gens(call.block), until)
+            }
         }
         failure?.let { throw it }
         return flush
