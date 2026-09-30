@@ -179,4 +179,24 @@ class StateTest {
         assertEquals(1L, db.one("dns_query_allowed", mapOf("endpoint" to "initialize"))!!["allowed"])
         assertEquals(0L, db.one("dns_query_allowed", mapOf("endpoint" to "initialize"))!!["allowed"])
     }
+
+    @Test
+    fun diagnostics_markers_leave_out_null_members() {
+        val db = newDb()
+        db.startSession()
+        val none = mapOf("step" to null, "success" to null, "status_code" to null, "attempt" to null,
+            "sdk_region" to null, "error" to null, "has_network" to null, "evaluation_details" to null)
+        db.run("mark", none + mapOf("context" to "c", "key" to "overall", "action" to "start"))
+        db.run("mark", none + mapOf("context" to "c", "key" to "initialize", "action" to "end",
+            "step" to "network_request", "success" to true, "status_code" to 200L, "has_network" to false,
+            "error" to """{"name":"E","code":null}""", "evaluation_details" to """{"reason":"Network"}"""))
+        val markers = (db.scalar("SELECT json_group_array(json(marker)) FROM marker") as String)
+            .replace(Regex(""""timestamp":[0-9.e+]+"""), """"timestamp":0""")
+        assertEquals(
+            """[{"key":"overall","action":"start","timestamp":0},""" +
+                """{"key":"initialize","action":"end","timestamp":0,"step":"network_request","success":true,""" +
+                """"statusCode":200,"error":{"name":"E"},"hasNetwork":false,"evaluationDetails":{"reason":"Network"}}]""",
+            markers
+        )
+    }
 }

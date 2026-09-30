@@ -6,9 +6,14 @@
 CREATE TEMP TABLE IF NOT EXISTS v2_value (id TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID;
 CREATE TEMP TABLE IF NOT EXISTS v2_exposure (id TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID;
 
--- IDs compared by the bootstrap block.
-CREATE TEMP TABLE IF NOT EXISTS bootstrap_user_ids (key TEXT, value TEXT);
-CREATE TEMP TABLE IF NOT EXISTS bootstrap_evaluated_ids (key TEXT, value TEXT);
+-- The user's IDs (userID + customIDs, stableID ignored), compared with evaluated_keys by the
+-- bootstrap block.
+CREATE TEMP VIEW IF NOT EXISTS bootstrap_user_id AS
+SELECT c.key, c.value FROM session AS s, json_each(s.user, '$.customIDs') AS c
+  WHERE c.key <> 'stableID' AND c.type IN ('text', 'null')
+UNION ALL
+SELECT 'userID', json_extract(user, '$.userID') FROM session
+  WHERE json_extract(user, '$.userID') IS NOT NULL;
 
 -- Scratch row through which every set of values (network, cache, bootstrap) is applied.
 CREATE TEMP TABLE IF NOT EXISTS values_work (
@@ -31,8 +36,11 @@ CREATE TEMP TABLE IF NOT EXISTS values_work (
     ELSE cached_header END) STORED
 );
 
--- Replaces the values in use: header fields on `session`, rows in `entity`. The values_work row
--- stays until the block that inserted it deletes it.
+-- Replaces the values in use: header fields on `session` (values_apply), rows in `entity` (one
+-- trigger per kind of payload, so that each insert runs only the statements its payload needs).
+-- The values_work row stays until the block that inserted it deletes it. (Blocks insert with
+-- VALUES: an INSERT ... SELECT into a table with triggers first copies its rows to a temporary
+-- table.)
 CREATE TEMP TRIGGER IF NOT EXISTS values_apply AFTER INSERT ON values_work
 WHEN NOT NEW.only_if_updates OR coalesce(NEW.header ->> 1, 0)
 BEGIN
@@ -49,35 +57,52 @@ BEGIN
     sdk_flags = NEW.header ->> 6,
     sdk_configs = NEW.header ->> 7,
     bootstrap_metadata = NEW.bootstrap_metadata;
+END;
 
+-- v1 (the usual response): each entity object is stored as is.
+-- (One pass over the payload: the sections are read from its top-level members.)
+CREATE TEMP TRIGGER IF NOT EXISTS values_apply_v1 AFTER INSERT ON values_work
+WHEN (NOT NEW.only_if_updates OR coalesce(NEW.header ->> 1, 0))
+  AND NEW.from_cache IS NULL AND NEW.header ->> 8 IS NOT 'init-v2'
+BEGIN
   DELETE FROM entity_body;
-
-  -- v1 (the usual response): each entity object is stored as is.
-  -- (One pass over the payload: the sections are read from its top-level members.)
   INSERT OR REPLACE INTO entity_body (kind, name, body)
     SELECT CASE s.key WHEN 'feature_gates' THEN 'gate' WHEN 'dynamic_configs' THEN 'config'
         WHEN 'layer_configs' THEN 'layer' ELSE 'param_store' END,
       e.key, e.value
     FROM json_each(NEW.payload) AS s, json_each(s.value) AS e
     WHERE s.type = 'object' AND e.type = 'object'
-      AND (s.key = 'param_stores' OR (s.key IN ('feature_gates', 'dynamic_configs', 'layer_configs')
-        AND NEW.header ->> 8 IS NOT 'init-v2'));
+      AND s.key IN ('feature_gates', 'dynamic_configs', 'layer_configs', 'param_stores');
+END;
 
-  -- Values stored as applied.
+-- Values stored as applied.
+CREATE TEMP TRIGGER IF NOT EXISTS values_apply_cached AFTER INSERT ON values_work
+WHEN (NOT NEW.only_if_updates OR coalesce(NEW.header ->> 1, 0)) AND NEW.from_cache IS NOT NULL
+BEGIN
+  DELETE FROM entity_body;
   INSERT OR REPLACE INTO entity_body (kind, name, body)
     SELECT kind, name, body FROM cached_entity WHERE cache_key = NEW.from_cache;
+END;
 
+CREATE TEMP TRIGGER IF NOT EXISTS values_apply_v2 AFTER INSERT ON values_work
+WHEN (NOT NEW.only_if_updates OR coalesce(NEW.header ->> 1, 0))
+  AND NEW.from_cache IS NULL AND NEW.header ->> 8 = 'init-v2'
+BEGIN
+  DELETE FROM entity_body;
+  INSERT OR REPLACE INTO entity_body (kind, name, body)
+    SELECT 'param_store', e.key, e.value
+    FROM json_each(NEW.payload, '$.param_stores') AS e
+    WHERE e.type = 'object';
   -- init-v2 (compact bootstrap format): short keys; values and exposures are shared through
-  -- lookup tables referenced by id (read once into v2_value / v2_exposure). For other formats
-  -- json_each gets NULL, so the payload is not read again.
+  -- lookup tables referenced by id (read once into v2_value / v2_exposure).
   DELETE FROM v2_value;
   DELETE FROM v2_exposure;
   INSERT OR REPLACE INTO v2_value (id, value)
     SELECT key, value
-    FROM json_each(CASE WHEN NEW.header ->> 8 = 'init-v2' THEN NEW.payload END, '$.values');
+    FROM json_each(NEW.payload, '$.values');
   INSERT OR REPLACE INTO v2_exposure (id, value)
     SELECT key, value
-    FROM json_each(CASE WHEN NEW.header ->> 8 = 'init-v2' THEN NEW.payload END, '$.exposures');
+    FROM json_each(NEW.payload, '$.exposures');
   INSERT OR REPLACE INTO entity_body (kind, name, body)
     SELECT k.kind, e.key, json_object(
       'value', CASE WHEN k.kind = 'gate' THEN json(CASE WHEN json_extract(e.value, '$.v') THEN 'true' ELSE 'false' END)
@@ -101,7 +126,7 @@ BEGIN
     FROM (SELECT 'gate' AS kind, '$.feature_gates' AS path
           UNION ALL SELECT 'config', '$.dynamic_configs'
           UNION ALL SELECT 'layer', '$.layer_configs') AS k,
-      json_each(CASE WHEN NEW.header ->> 8 = 'init-v2' THEN NEW.payload END, k.path) AS e
+      json_each(NEW.payload, k.path) AS e
     WHERE e.type = 'object';
   DELETE FROM v2_value;
   DELETE FROM v2_exposure;
@@ -323,25 +348,26 @@ UPDATE session SET source = 'NoValues' WHERE source <> 'Cache';
 -- @writes: values
 -- Values provided by the app (StatsigOptions.initializeValues / updateUser(values)). They are
 -- used as-is for this client and never persisted. evaluated_keys, when present, must match the
--- user's IDs (userID + customIDs, stableID ignored) or the source is InvalidBootstrap.
-INSERT INTO bootstrap_user_ids (key, value)
-  SELECT key, value FROM json_each((SELECT user FROM session), '$.customIDs')
-    WHERE key <> 'stableID' AND type IN ('text', 'null')
-  UNION
-  SELECT 'userID', json_extract(user, '$.userID') FROM session
-    WHERE json_extract(user, '$.userID') IS NOT NULL;
--- evaluated_keys may nest maps (e.g. customIDs); their string entries count, arrays do not
-INSERT INTO bootstrap_evaluated_ids (key, value)
-  SELECT key, value FROM json_tree(:values, '$.evaluated_keys')
-  WHERE type IN ('text', 'null') AND key <> 'stableID'
-    AND fullkey NOT LIKE '%[%' AND fullkey NOT LIKE '%.stableID.%';
+-- user's IDs (userID + customIDs, stableID ignored) or the source is InvalidBootstrap; the outcome
+-- is kept with the values, for when the same user gets the same values again. (json_tree walks the
+-- extracted evaluated_keys: given the payload, it would parse all of it, each time.)
 INSERT INTO values_work (payload, user_hash, source, set_received, received_at, bootstrap_metadata)
-  SELECT :values, '',
+  VALUES (:values, '',
+    coalesce((SELECT m.source FROM memory_values AS m, session AS s
+                WHERE m.cache_key = s.cache_key AND m.payload = :values),
     CASE WHEN json_type(:values, '$.evaluated_keys') IS NOT 'object' THEN 'Bootstrap'
-      WHEN NOT EXISTS (SELECT * FROM bootstrap_user_ids EXCEPT SELECT * FROM bootstrap_evaluated_ids)
-        AND NOT EXISTS (SELECT * FROM bootstrap_evaluated_ids EXCEPT SELECT * FROM bootstrap_user_ids)
+      WHEN NOT EXISTS (SELECT 1 FROM bootstrap_user_id AS u WHERE NOT EXISTS (
+          SELECT 1 FROM json_tree(json_extract(:values, '$.evaluated_keys')) AS e
+          WHERE e.type IN ('text', 'null') AND e.key <> 'stableID'
+            AND e.fullkey NOT LIKE '%[%' AND e.fullkey NOT LIKE '%.stableID.%'
+            AND e.key = u.key AND e.value IS u.value))
+        AND NOT EXISTS (SELECT 1 FROM json_tree(json_extract(:values, '$.evaluated_keys')) AS e
+          WHERE e.type IN ('text', 'null') AND e.key <> 'stableID'
+            AND e.fullkey NOT LIKE '%[%' AND e.fullkey NOT LIKE '%.stableID.%'
+            AND NOT EXISTS (SELECT 1 FROM bootstrap_user_id AS u
+              WHERE u.key = e.key AND u.value IS e.value))
       THEN 'Bootstrap'
-      ELSE 'InvalidBootstrap' END,
+      ELSE 'InvalidBootstrap' END),
     0, NULL,
     nullif(json_patch('{}', json_object(
       'generatorSDKInfo', CASE WHEN json_type(:values, '$.sdkInfo') = 'object' THEN json_patch('{}', json_object(
@@ -359,13 +385,10 @@ INSERT INTO values_work (payload, user_hash, source, set_received, received_at, 
         'appVersion', json_extract(:values, '$.user.appVersion'),
         'custom', json(json_extract(:values, '$.user.custom')),
         'customIDs', json(json_extract(:values, '$.user.customIDs')),
-        'statsigEnvironment', json(json_extract(:values, '$.user.statsigEnvironment')))) END)), '{}')
-  FROM session AS s;
+        'statsigEnvironment', json(json_extract(:values, '$.user.statsigEnvironment')))) END)), '{}'));
 DELETE FROM values_work;
-DELETE FROM bootstrap_user_ids;
-DELETE FROM bootstrap_evaluated_ids;
-INSERT OR REPLACE INTO memory_values (cache_key, scoped_key, payload, bootstrap_metadata)
-  SELECT cache_key, scoped_key, :values, bootstrap_metadata FROM session;
+INSERT OR REPLACE INTO memory_values (cache_key, scoped_key, payload, bootstrap_metadata, source)
+  SELECT cache_key, scoped_key, :values, bootstrap_metadata, source FROM session;
 
 
 -- name: session_state
@@ -578,7 +601,5 @@ INSERT OR REPLACE INTO setting (key, value) VALUES ('legacy_imported', '1');
 -- name: reset
 DELETE FROM v2_value;
 DELETE FROM v2_exposure;
-DELETE FROM bootstrap_user_ids;
-DELETE FROM bootstrap_evaluated_ids;
 DELETE FROM values_work;
 DELETE FROM lookup;

@@ -177,7 +177,8 @@ CREATE TEMP TABLE IF NOT EXISTS memory_values (
   cache_key TEXT PRIMARY KEY,
   scoped_key TEXT NOT NULL,
   payload TEXT NOT NULL,
-  bootstrap_metadata TEXT
+  bootstrap_metadata TEXT,
+  source TEXT                        -- Bootstrap | InvalidBootstrap (for this user and payload)
 );
 
 -- name: reset

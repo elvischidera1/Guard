@@ -324,7 +324,12 @@ class Scenario(private val app: HarnessApp = HarnessApp(), val server: FakeServe
 fun main(args: Array<String>) {
     Dispatchers.setMain(Executors.newSingleThreadExecutor { r -> Thread(r, "main").apply { isDaemon = true } }.asCoroutineDispatcher())
     val scenario = Scenario()
-    runBlocking(Dispatchers.IO) { scenario.run() }
+    try {
+        runBlocking(Dispatchers.IO) { scenario.run() }
+    } catch (e: Throwable) {
+        e.printStackTrace()
+        System.exit(1) // the fake server's threads would keep the JVM alive
+    }
     scenario.server.close()
     val out = File(args[0])
     out.parentFile.mkdirs()

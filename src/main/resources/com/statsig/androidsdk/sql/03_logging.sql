@@ -241,36 +241,38 @@ SELECT body, n FROM batch;
 
 -- name: mark
 -- @writes: events
--- A diagnostics marker. Booleans are 0/1/NULL; :error and :evaluation_details are JSON.
+-- A diagnostics marker. Booleans are 0/1/NULL; :error and :evaluation_details are JSON. Members
+-- that are null are left out, also inside the JSON arguments (json_patch drops them).
 INSERT INTO marker (context, marker)
-  SELECT :context, json_patch('{}', json_object(
-    'key', :key,
-    'action', :action,
-    'timestamp', (julianday('now') - 2440587.5) * 86400000.0,
-    'step', :step,
-    'success', json(CASE :success WHEN 1 THEN 'true' WHEN 0 THEN 'false' END),
-    'statusCode', :status_code,
-    'attempt', :attempt,
-    'sdkRegion', :sdk_region,
-    'error', json(:error),
-    'hasNetwork', json(CASE :has_network WHEN 1 THEN 'true' WHEN 0 THEN 'false' END),
-    'evaluationDetails', json(:evaluation_details)))
+  SELECT :context, '{' || substr(
+    iif(:key IS NULL, '', ',"key":' || json_quote(:key))
+    || iif(:action IS NULL, '', ',"action":' || json_quote(:action))
+    || ',"timestamp":' || json_quote((julianday('now') - 2440587.5) * 86400000.0)
+    || iif(:step IS NULL, '', ',"step":' || json_quote(:step))
+    || CASE :success WHEN 1 THEN ',"success":true' WHEN 0 THEN ',"success":false' ELSE '' END
+    || iif(:status_code IS NULL, '', ',"statusCode":' || json_quote(:status_code))
+    || iif(:attempt IS NULL, '', ',"attempt":' || json_quote(:attempt))
+    || iif(:sdk_region IS NULL, '', ',"sdkRegion":' || json_quote(:sdk_region))
+    || coalesce(',"error":' || json_patch('{}', :error), '')
+    || CASE :has_network WHEN 1 THEN ',"hasNetwork":true' WHEN 0 THEN ',"hasNetwork":false' ELSE '' END
+    || coalesce(',"evaluationDetails":' || json_patch('{}', :evaluation_details), ''), 2) || '}'
   WHERE (SELECT count(*) FROM marker WHERE context = :context) < 30;
 
 
 -- name: log_diagnostics
 -- @reads: events
 -- @writes: events
--- Turns the markers of :context into one statsig::diagnostics event and clears them.
+-- Turns the markers of :context into one statsig::diagnostics event and clears them. (Like the
+-- original, the event carries the markers and the options as JSON strings.)
 INSERT INTO event_queue (event)
-  SELECT json_object(
-    'eventName', 'statsig::diagnostics',
-    'user', json(json_remove(s.first_user, '$.privateAttributes')),
-    'time', c.now_ms,
-    'metadata', json_object(
-      'context', :context,
-      'markers', '' || (SELECT json_group_array(json(marker)) FROM (SELECT marker FROM marker WHERE context = :context ORDER BY id)),
-      'statsigOptions', CASE WHEN :context = 'initialize' THEN coalesce(s.options, 'null') ELSE 'null' END))
+  SELECT '{"eventName":"statsig::diagnostics","user":'
+    || coalesce(json_remove(s.first_user, '$.privateAttributes'), 'null')
+    || ',"time":' || c.now_ms
+    || ',"metadata":{"context":' || json_quote(:context)
+    || ',"markers":' || json_quote('[' || (SELECT group_concat(marker, ',')
+         FROM (SELECT marker FROM marker WHERE context = :context ORDER BY id)) || ']')
+    || ',"statsigOptions":' || json_quote(CASE WHEN :context = 'initialize'
+         THEN coalesce(s.options, 'null') ELSE 'null' END) || '}}'
   FROM session AS s, clock AS c
   WHERE EXISTS (SELECT 1 FROM marker WHERE context = :context);
 DELETE FROM marker WHERE context = :context;
