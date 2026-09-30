@@ -13,9 +13,9 @@ left in Kotlin is the public API, the model classes, and the I/O that SQL cannot
   engine. Another platform ports it by running the same `.sql` files through its SQLite binding.
 - **Behavior.** It matches the original SDK: a public-API script of 337 observations gives the same
   results on both SDKs, except one diagnostics event where the original has a bug (fixed here).
-- **Performance.** It is slower. Hot-path reads (`checkGate`, `getConfig`) went from about 1 µs to
-  tens of µs. `initialize` is about 2–3× slower. On-device evaluation went from about 1 µs to
-  hundreds of µs. Details and mitigations are [below](#benchmark-before-and-after).
+- **Performance.** It is slower. Hot-path reads (`checkGate`, `getConfig`) went from under 1 µs to
+  30–50 µs. `initialize` is about 2–5× slower. On-device evaluation went from a few µs to
+  0.4–1.1 ms. Details and mitigations are [below](#benchmark-before-and-after).
 - **Compatibility.** The SQL needs SQLite 3.38+, which Android ships from API 34 (Android 14). Older
   devices need a bundled SQLite, which `StatsigClient.sqlDriverFactory` lets an app plug in.
 
@@ -164,11 +164,36 @@ code.
   the original's storage cost is, if anything, understated.
 - The SQL SDK uses a file-backed SQLite database through sqlite-jdbc.
 
-BENCHMARK_TABLE
+| Benchmark (median per operation) | Original | SQL | Ratio |
+| --- | ---: | ---: | ---: |
+| initialize (network, fresh install) | 17.5 ms | 40.8 ms | 2.3× |
+| initialize (network, warm cache) | 13.4 ms | 30.1 ms | 2.3× |
+| initialize (offline, from cache) | 6.4 ms | 21.9 ms | 3.4× |
+| initialize (network, 2000 gates+2000 configs) | 56.7 ms | 148.4 ms | 2.6× |
+| initialize (offline, 2000+2000 from cache) | 19.2 ms | 100.8 ms | 5.3× |
+| checkGate (hit, deduped exposure) | 694 ns | 44.6 µs | 64.3× |
+| checkGate (miss) | 489 ns | 38.7 µs | 79.2× |
+| checkGateWithExposureLoggingDisabled | 588 ns | 29.7 µs | 50.5× |
+| getConfig + getString | 957 ns | 52.7 µs | 55.1× |
+| getExperiment(keepDeviceValue=true) | 20.8 µs | 86.4 µs | 4.1× |
+| getLayer + getString (param exposure) | 546 ns | 106.3 µs | 194.8× |
+| getParameterStore + getString(static) | 405 ns | 34.5 µs | 85.2× |
+| getParameterStore + getString(gate ref) | 500 ns | 82.3 µs | 164.8× |
+| overridden gate | 174 ns | 38.8 µs | 223.0× |
+| checkGate (unique names -> new exposure each) | 22.8 µs | 194.2 µs | 8.5× |
+| logEvent x2000 + flush | 27.0 µs | 173.8 µs | 6.4× |
+| updateUser(values) bootstrap switch | 221.6 µs | 222.1 µs | 1.0× |
+| updateUser (network) switch between 2 users | 2.4 ms | 3.9 ms | 1.6× |
+| checkGate on 2000-gate payload (hit) | 1.0 µs | 47.1 µs | 45.7× |
+| getConfig on 2000-config payload | 1.1 µs | 48.2 µs | 45.2× |
+| on-device checkGate (public rule) | 1.7 µs | 371.5 µs | 218.9× |
+| on-device checkGate (nested pass_gate) | 8.3 µs | 1.1 ms | 126.8× |
+| on-device checkGate (bucketing/sha256) | 1.8 µs | 439.2 µs | 238.6× |
+| on-device getLayer (delegated experiment) | 3.6 µs | 743.4 µs | 204.0× |
 
 **Reading the numbers**
 
-- **Hot-path reads are 1–2 orders of magnitude slower.**
+- **Hot-path reads are 50–200× slower (about 30–100 µs instead of under 1 µs).**
   - Examples: `checkGate`, `getConfig`, layer and parameter-store reads.
   - The original answers these from a `HashMap`. Now each call is 2–4 SQLite statements: a lookup,
     then an exposure insert that a trigger de-duplicates.
@@ -177,14 +202,18 @@ BENCHMARK_TABLE
   - In absolute terms a check costs tens of µs, i.e. tens of thousands of checks per second.
     That's fine for app UIs, which check a handful of gates per screen, but it is a real
     regression for code that checks gates in tight loops.
-- **`getExperiment(keepDeviceValue=true)` is comparable.** The original re-wrote the user's whole
-  cache as JSON on every sticky read; the SQL writes one row.
-- **Initialization is about 2–3× slower.** Setup creates the schema on a fresh connection and
+- **Write-heavy paths lose much less.**
+  - Sticky `getExperiment` is about 4× slower; the original also paid for a write here (it
+    re-serialized the user's whole cache on every sticky read).
+  - New exposures and `logEvent` + flush are 6–9× slower.
+  - Bootstrap `updateUser(values)` is on par.
+- **Initialization is about 2–5× slower.** Setup creates the schema on a fresh connection and
   applies payloads with `json_each`. Large payloads (2,000 gates + 2,000 configs) cost more to
-  apply than Gson took to parse, but `initialize` stays in the tens-to-hundreds of milliseconds.
+  apply than Gson took to parse, but `initialize`
+  stays in the tens to low hundreds of milliseconds (40 ms fresh, 150 ms for the large payload).
 - **On-device evaluation is the most expensive part.**
-  - It went from about 1 µs to hundreds of µs per check, because each evaluation is several
-    set-based SQL passes.
+  - It went from a few µs to 0.4–1.1 ms per check, because each evaluation is several set-based
+    SQL passes. That is after a first optimization pass made it 4–5× faster.
   - SHA-256 written in SQL costs about 0.5–1 ms per new input. It is memoized, and only the rules
     that decide the result are hashed.
 - **Where the difference really comes from:** an interpreted query engine behind a
