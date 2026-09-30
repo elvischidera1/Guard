@@ -13,6 +13,8 @@ class SqlScriptTest {
                 """
                 -- header comment
                 -- name: one
+                -- @cache
+                -- @reads: values, events
                 -- leading comment
                 SELECT ':not_a_param', "col:x", :a || ':' || :b -- trailing :comment
                 FROM t;
@@ -28,14 +30,17 @@ class SqlScriptTest {
                 """.trimIndent()
             )
         )
-        val one = script.block("one")
+        val oneBlock = script.block("one")
+        assertTrue(oneBlock.cache && !oneBlock.defer)
+        assertEquals(setOf("values", "events"), oneBlock.reads)
+        val one = oneBlock.statements
         assertEquals(2, one.size)
         assertEquals(listOf("a", "b"), one[0].params)
         assertTrue(one[0].returnsRows)
         assertTrue(one[0].sql.contains("':not_a_param'"))
         assertFalse(one[0].sql.contains("comment"))
         assertFalse(one[1].returnsRows)
-        val two = script.block("two")
+        val two = script.block("two").statements
         assertEquals(2, two.size)
         assertTrue(two[0].sql.startsWith("CREATE TEMP TRIGGER") && two[0].sql.contains("SELECT 1;"))
         assertEquals(listOf("c"), two[1].params)
@@ -48,9 +53,9 @@ class SqlScriptTest {
         val db = newDb()
         val driver = StatsigDb::class.java.getDeclaredField("driver").apply { isAccessible = true }.get(db) as JdbcSqlDriver
         val prepare = JdbcSqlDriver::class.java.getDeclaredField("connection").apply { isAccessible = true }.get(driver) as java.sql.Connection
-        for ((name, statements) in SqlScript.default.blocks) {
+        for ((name, block) in SqlScript.default.blocks) {
             if (name == "schema") continue
-            for (statement in statements) prepare.prepareStatement(statement.sql).close()
+            for (statement in block.statements) prepare.prepareStatement(statement.sql).close()
         }
     }
 }

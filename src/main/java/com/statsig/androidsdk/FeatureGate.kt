@@ -19,6 +19,14 @@ class FeatureGate(
         )
     }
 
+    /** getSecondaryExposures() as JSON, when this gate came from the SDK's SQL. */
+    @Transient
+    internal var secondaryExposuresJson: String? = null
+
+    /** Parameters of this gate's automatic exposure, built on first use. */
+    @Transient
+    internal var exposureParams: Map<String, Any?>? = null
+
     fun getValue(): Boolean = this.value
 
     fun getRuleID(): String = this.rule

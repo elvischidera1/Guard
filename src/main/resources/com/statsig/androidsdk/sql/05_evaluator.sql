@@ -608,5 +608,7 @@ SELECT (SELECT count(*) FROM eval_cond) + (SELECT count(*) FROM eval_result) AS 
 SELECT r.bool, r.value, r.rule_id, r.group_name, r.secondary, r.undelegated,
   r.is_experiment_group, r.is_active, r.config_delegate, r.explicit_parameters, r.unrecognized,
   (SELECT max(unsupported) FROM eval_result) AS any_unsupported,
+  -- the answer only changes with the specs and the user, unless a condition reads the clock
+  NOT EXISTS (SELECT 1 FROM eval_cond_ctx WHERE type = 'current_time') AS cacheable,
   d.time AS lcut, d.received_at
 FROM dcs AS d LEFT JOIN eval_result AS r ON r.kind = :kind AND r.name = :name;

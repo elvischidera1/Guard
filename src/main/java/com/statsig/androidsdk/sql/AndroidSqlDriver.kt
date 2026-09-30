@@ -25,12 +25,11 @@ internal class AndroidSqlDriver(path: String) : SqlDriver {
         setMaxSqlCacheSize(SQLiteDatabase.MAX_SQL_CACHE_SIZE)
     }
 
-    override fun execute(sql: String, args: List<Any?>) {
+    override fun execute(sql: String, args: List<Any?>): Int =
         db.compileStatement(sql).use { statement ->
             bind(statement, args)
-            statement.execute()
+            statement.executeUpdateDelete()
         }
-    }
 
     override fun query(sql: String, args: List<Any?>): List<Row> = try {
         query(sql, args, null)

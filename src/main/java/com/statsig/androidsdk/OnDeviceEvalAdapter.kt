@@ -2,6 +2,7 @@ package com.statsig.androidsdk
 
 import com.statsig.androidsdk.sql.Row
 import com.statsig.androidsdk.sql.StatsigDb
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Evaluates gates, configs, layers and parameter stores on the device from a config-specs
@@ -22,6 +23,14 @@ class OnDeviceEvalAdapter(data: String?) {
     @Volatile
     private var db: StatsigDb? = null
 
+    /** Time of the specs in [db], or null if none are loaded. */
+    @Volatile
+    private var specsTime: Long? = null
+
+    /** Answers for (kind, name) and the user object they were computed for. */
+    private val results = ConcurrentHashMap<String, Pair<StatsigUser, Row>>()
+    private val models = ConcurrentHashMap<String, Pair<Row, Any>>()
+
     init {
         data?.let { setData(it) }
     }
@@ -29,57 +38,78 @@ class OnDeviceEvalAdapter(data: String?) {
     fun setData(data: String) {
         this.data = data
         receivedAt = System.currentTimeMillis()
-        db?.run("dcs_load", mapOf("payload" to data, "received_at" to receivedAt))
+        db?.let { load(it, data) }
     }
 
     /** Called by the client that uses this adapter, with its database. */
     internal fun attach(db: StatsigDb) {
         this.db = db
-        data?.let { db.run("dcs_load", mapOf("payload" to it, "received_at" to receivedAt)) }
+        specsTime = null
+        results.clear()
+        data?.let { load(db, it) }
+    }
+
+    private fun load(db: StatsigDb, data: String) = synchronized(db) {
+        db.run("dcs_load", mapOf("payload" to data, "received_at" to receivedAt))
+        results.clear()
+        specsTime = db.one("dcs_time")?.long("time")
     }
 
     fun getGate(current: FeatureGate, user: StatsigUser): FeatureGate? {
         val row = evaluate("gate", current, user) ?: return null
-        return FeatureGate(
-            current.getName(),
-            row.onDeviceDetails(),
-            row.bool("bool"),
-            row.string("rule_id") ?: "",
-            row.string("group_name"),
-            jsonExposures(row.string("secondary"))
-        )
+        return model("gate:${current.getName()}", row) {
+            FeatureGate(
+                current.getName(),
+                row.onDeviceDetails(),
+                row.bool("bool"),
+                row.string("rule_id") ?: "",
+                row.string("group_name"),
+                jsonExposures(row.string("secondary"))
+            ).also { it.secondaryExposuresJson = row.string("secondary") }
+        }
     }
 
     fun getDynamicConfig(current: DynamicConfig, user: StatsigUser): DynamicConfig? {
         val row = evaluate("config", current, user) ?: return null
-        return DynamicConfig(
-            name = current.getName(),
-            details = row.onDeviceDetails(),
-            jsonValue = jsonObject(row.string("value")),
-            rule = row.string("rule_id") ?: "",
-            groupName = row.string("group_name"),
-            secondaryExposures = jsonExposures(row.string("secondary")),
-            isExperimentActive = row.bool("is_active"),
-            isUserInExperiment = row.bool("is_experiment_group")
-        )
+        return model("config:${current.getName()}", row) {
+            DynamicConfig(
+                name = current.getName(),
+                details = row.onDeviceDetails(),
+                jsonValue = jsonObject(row.string("value")),
+                rule = row.string("rule_id") ?: "",
+                groupName = row.string("group_name"),
+                secondaryExposures = jsonExposures(row.string("secondary")),
+                isExperimentActive = row.bool("is_active"),
+                isUserInExperiment = row.bool("is_experiment_group")
+            ).also { it.secondaryExposuresJson = row.string("secondary") }
+        }
     }
 
     fun getLayer(client: StatsigClient?, current: Layer, user: StatsigUser): Layer? {
         val row = evaluate("layer", current, user) ?: return null
-        return Layer(
-            client = client,
-            name = current.getName(),
-            details = row.onDeviceDetails(),
-            jsonValue = jsonObject(row.string("value")),
-            rule = row.string("rule_id") ?: "",
-            groupName = row.string("group_name"),
-            secondaryExposures = jsonExposures(row.string("secondary")),
-            undelegatedSecondaryExposures = jsonExposures(row.string("undelegated")),
-            isExperimentActive = row.bool("is_active"),
-            isUserInExperiment = row.bool("is_experiment_group"),
-            allocatedExperimentName = row.string("config_delegate"),
-            explicitParameters = jsonStrings(row.string("explicit_parameters"))
-        )
+        return model("layer:${client != null}:${current.getName()}", row) {
+            Layer(
+                client = client,
+                name = current.getName(),
+                details = row.onDeviceDetails(),
+                jsonValue = jsonObject(row.string("value")),
+                rule = row.string("rule_id") ?: "",
+                groupName = row.string("group_name"),
+                secondaryExposures = jsonExposures(row.string("secondary")),
+                undelegatedSecondaryExposures = jsonExposures(row.string("undelegated")),
+                isExperimentActive = row.bool("is_active"),
+                isUserInExperiment = row.bool("is_experiment_group"),
+                allocatedExperimentName = row.string("config_delegate"),
+                explicitParameters = jsonStrings(row.string("explicit_parameters"))
+            )
+        }
+    }
+
+    /** The model built from [row]: rebuilt only when the evaluation result is a new row. */
+    @Suppress("UNCHECKED_CAST")
+    private fun <T : Any> model(key: String, row: Row, build: () -> T): T {
+        models[key]?.let { (builtFrom, model) -> if (builtFrom === row) return model as T }
+        return build().also { models[key] = row to it }
     }
 
     fun getParamStore(client: StatsigClient, current: ParameterStore): ParameterStore? {
@@ -99,10 +129,12 @@ class OnDeviceEvalAdapter(data: String?) {
     /** Runs the SQL evaluation of kind/name when the specs are newer than [current]'s values. */
     private fun evaluate(kind: String, current: BaseConfig, user: StatsigUser): Row? {
         val db = db ?: return null
+        val time = specsTime ?: return null
+        if (time <= (current.getEvalDetails().lcut ?: 0)) return null
+        val name = current.getName()
+        val key = "$kind:$name"
+        results[key]?.let { (cachedUser, row) -> if (cachedUser === user) return row }
         synchronized(db) {
-            val time = db.one("dcs_time")?.long("time") ?: return null
-            if (time <= (current.getEvalDetails().lcut ?: 0)) return null
-            val name = current.getName()
             val regexRequests = db.run(
                 "eval_begin",
                 mapOf("kind" to kind, "name" to name, "user" to gson.toJson(user))
@@ -138,7 +170,9 @@ class OnDeviceEvalAdapter(data: String?) {
                 )
             }
             // a spec that could not be resolved (e.g. a gate cycle) is reported as unrecognized
-            return if (row["bool"] == null) row + ("unrecognized" to 1L) else row
+            val result = if (row["bool"] == null) row + ("unrecognized" to 1L) else row
+            if (row.bool("cacheable")) results[key] = user to result
+            return result
         }
     }
 

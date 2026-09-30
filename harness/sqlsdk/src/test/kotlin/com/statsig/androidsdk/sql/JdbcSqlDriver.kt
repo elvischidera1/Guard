@@ -14,9 +14,7 @@ internal class JdbcSqlDriver(path: String) : SqlDriver {
     private val statements = HashMap<String, PreparedStatement>()
     private val columns = HashMap<String, List<String>>()
 
-    override fun execute(sql: String, args: List<Any?>) {
-        prepare(sql, args).execute()
-    }
+    override fun execute(sql: String, args: List<Any?>): Int = prepare(sql, args).executeUpdate()
 
     override fun query(sql: String, args: List<Any?>): List<Row> {
         prepare(sql, args).executeQuery().use { rs ->
@@ -38,11 +36,17 @@ internal class JdbcSqlDriver(path: String) : SqlDriver {
     }
 
     // Plain SQL (cached statements) rather than setAutoCommit(), which re-prepares each time.
-    override fun beginTransaction() = execute("BEGIN", emptyList())
+    override fun beginTransaction() {
+        execute("BEGIN", emptyList())
+    }
 
-    override fun commit() = execute("COMMIT", emptyList())
+    override fun commit() {
+        execute("COMMIT", emptyList())
+    }
 
-    override fun rollback() = execute("ROLLBACK", emptyList())
+    override fun rollback() {
+        execute("ROLLBACK", emptyList())
+    }
 
     override fun close() {
         statements.values.forEach { it.close() }

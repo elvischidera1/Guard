@@ -12,7 +12,8 @@ typealias Row = Map<String, Any?>
  * String or null. See [com.statsig.androidsdk.StatsigClient.sqlDriverFactory].
  */
 interface SqlDriver : Closeable {
-    fun execute(sql: String, args: List<Any?>)
+    /** Runs a statement that returns no rows. Returns the rows an INSERT/UPDATE/DELETE changed. */
+    fun execute(sql: String, args: List<Any?>): Int
 
     fun query(sql: String, args: List<Any?>): List<Row>
 

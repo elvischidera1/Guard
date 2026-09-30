@@ -191,6 +191,24 @@ class Layer internal constructor(
             else -> null
         }
 
+    /** Exposure fields as JSON, computed once per layer object. */
+    internal class ExposureJson(
+        val explicit: String?,
+        val secondary: String?,
+        val undelegated: String?
+    )
+
+    @Transient
+    internal var exposureJson: ExposureJson? = null
+
+    /** Parameters of automatic exposures by parameter name, built on first use. */
+    @Transient
+    private var exposureParamsByName: MutableMap<String, Map<String, Any?>>? = null
+
+    internal fun exposureParams(): MutableMap<String, Map<String, Any?>> = exposureParamsByName
+        ?: java.util.concurrent.ConcurrentHashMap<String, Map<String, Any?>>()
+            .also { exposureParamsByName = it }
+
     fun getIsUserInExperiment(): Boolean = this.isUserInExperiment
 
     fun getIsExperimentActive(): Boolean = this.isExperimentActive

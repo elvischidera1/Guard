@@ -86,11 +86,11 @@ class StateTest {
         assertEquals(1L, db.scalar("SELECT count(*) FROM failed_log"))
     }
 
-    private fun logGate(db: StatsigDb, name: String) = db.one(
+    private fun logGate(db: StatsigDb, name: String) = db.run(
         "log_gate_exposure",
         mapOf("name" to name, "value" to true, "rule_id" to "r", "secondary" to "[]", "reason" to "Network:Recognized",
             "lcut" to 1L, "received_at" to 2L, "manual" to false)
-    )!!
+    )
 
     @Test
     fun exposures_are_deduplicated_for_ten_minutes_and_per_user() {
@@ -98,24 +98,39 @@ class StateTest {
         db.startSession()
         logGate(db, "g")
         logGate(db, "g")
+        db.drainDeferred()
+        logGate(db, "g")
+        db.drainDeferred()
         assertEquals(1L, db.scalar("SELECT count(*) FROM event_queue"))
         db.exec("UPDATE exposure_seen SET logged_at = logged_at - 600001")
+        db.forgetCaches() // the host would otherwise (rightly) skip calls within the 10 minutes
         logGate(db, "g")
+        db.drainDeferred()
         assertEquals(2L, db.scalar("SELECT count(*) FROM event_queue"))
+        // switching users runs the queued exposure first, as the previous user
+        logGate(db, "h")
         db.run("set_user", mapOf("user" to """{"userID":"u2"}""", "scoped_key" to "u2"))
-        logGate(db, "g")
         assertEquals(3L, db.scalar("SELECT count(*) FROM event_queue"))
+        assertEquals("u1", db.scalar("SELECT json_extract(event, '$.user.userID') FROM event_queue ORDER BY id DESC LIMIT 1"))
+        logGate(db, "g")
+        db.drainDeferred()
+        assertEquals(4L, db.scalar("SELECT count(*) FROM event_queue"))
     }
 
     @Test
     fun queue_asks_for_a_flush_at_50_and_keeps_the_newest_1000() {
         val db = newDb()
         db.startSession()
-        fun log(i: Int) = db.one("log_event", mapOf("event_name" to "e$i", "value" to null, "metadata" to null, "statsig_metadata" to null))!!
-        for (i in 1..48) log(i)
-        assertEquals(0L, log(49)["should_flush"])
-        assertEquals(1L, log(50)["should_flush"])
+        var flushes = 0
+        db.onShouldFlush = { flushes++ }
+        fun log(i: Int) = db.run("log_event", mapOf("event_name" to "e$i", "value" to null, "metadata" to null, "statsig_metadata" to null))
+        for (i in 1..49) log(i)
+        assertEquals(0, flushes)
+        log(50)
+        assertEquals(1, flushes)
+        assertEquals(50L, db.scalar("SELECT count(*) FROM event_queue"))
         for (i in 51..1005) log(i)
+        db.drainDeferred()
         assertEquals(1000L, db.scalar("SELECT count(*) FROM event_queue"))
         assertTrue((db.scalar("SELECT min(event) FROM event_queue WHERE json_extract(event, '$.eventName') = 'e6'") as String?) != null)
         assertNull(db.scalar("SELECT event FROM event_queue WHERE json_extract(event, '$.eventName') = 'e5'"))

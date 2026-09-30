@@ -153,7 +153,8 @@ CREATE TEMP TABLE IF NOT EXISTS lookup (
   passed INTEGER,
   parameter_rule_ids TEXT,
   sticky TEXT,                       -- kept value (JSON), get_experiment only
-  latest_exp_active INTEGER
+  latest_exp_active INTEGER,
+  writes INTEGER                     -- whether this get_experiment changes kept values
 );
 
 CREATE TEMP VIEW IF NOT EXISTS lookup_result AS
@@ -188,6 +189,7 @@ FROM session;
 
 
 -- name: session_start
+-- @writes: values, events
 -- Starts a client session for :user (evaluation copy, JSON). Clears all per-client state.
 DELETE FROM session;
 DELETE FROM entity;
@@ -219,6 +221,7 @@ SELECT value AS stable_id FROM setting WHERE key = 'stable_id';
 
 
 -- name: set_user
+-- @writes: values, events
 -- updateUser: switch the session to another user. Values stay until load_cache replaces them.
 DELETE FROM hash_memo WHERE rowid <= (SELECT max(rowid) FROM hash_memo) - 2048;
 INSERT INTO hash_input (algo, input)
@@ -235,6 +238,7 @@ DELETE FROM exposure_seen;
 
 
 -- name: load_cache
+-- @writes: values
 -- Makes the cached values for the session's user current (source Cache), or clears the values.
 -- Lookup order: this client's bootstrap values, then disk by exact key, then disk through the
 -- custom cache key mapping.
@@ -265,6 +269,7 @@ INSERT INTO values_work (payload, user_hash, source, set_received, received_at, 
 
 
 -- name: save_values
+-- @writes: values
 -- A successful initialize response for :user / :scoped_key (the session's user when the request
 -- was made). Ignored if the session has moved on to another user. Returns has_updates/applied.
 INSERT INTO values_work (payload, user_hash, source, set_received, received_at, bootstrap_metadata)
@@ -296,11 +301,13 @@ SELECT coalesce(json_extract(:payload, '$.has_updates'), 0) AS has_updates,
 
 
 -- name: network_failed
+-- @writes: values
 -- The initialize request failed: without cached values there is nothing to evaluate with.
 UPDATE session SET source = 'NoValues' WHERE source <> 'Cache';
 
 
 -- name: bootstrap
+-- @writes: values
 -- Values provided by the app (StatsigOptions.initializeValues / updateUser(values)). They are
 -- used as-is for this client and never persisted. evaluated_keys, when present, must match the
 -- user's IDs (userID + customIDs, stableID ignored) or the source is InvalidBootstrap.
@@ -348,6 +355,8 @@ INSERT OR REPLACE INTO memory_values (cache_key, scoped_key, payload, bootstrap_
 
 
 -- name: session_state
+-- @cache
+-- @reads: values
 -- Global evaluation details plus what the network layer needs.
 SELECT source, lcut, received_at, sdk_key, user, scoped_key,
   json_type(sdk_flags, '$.enable_log_event_compression') = 'true' AS compress_custom_urls
@@ -355,6 +364,8 @@ FROM session;
 
 
 -- name: values_json
+-- @cache
+-- @reads: values
 -- The values in use, as a v1 initialize response (getInitializeResponseJson, debug view).
 SELECT json_object(
     'feature_gates', json((SELECT json_group_object(name, json(json)) FROM entity_json WHERE kind = 'gate')),
@@ -373,6 +384,8 @@ FROM session;
 
 
 -- name: get_value
+-- @cache
+-- @reads: values
 -- checkGate / getConfig / getParameterStore (:kind 'gate' | 'config' | 'param_store'): the local
 -- override, else the served entity (by name, then by hashed name). Same columns as lookup_result.
 INSERT INTO hash_input (algo, input)
@@ -411,6 +424,9 @@ FROM session AS s
 
 
 -- name: get_experiment
+-- @cache
+-- @reads: values
+-- @writes: values
 -- getExperiment (:kind = 'config') and getLayer (:kind = 'layer'), with sticky values.
 -- With :keep = 1 the first value served while the user is in an active experiment is kept
 -- ("sticky") for as long as that experiment stays active. With :keep = 0 any kept value is
@@ -442,6 +458,12 @@ UPDATE lookup SET latest_exp_active = coalesce(
     THEN (SELECT is_experiment_active FROM entity
           WHERE kind = 'config' AND name = json_extract(lookup.sticky, '$.allocated_experiment_name'))
     ELSE is_experiment_active END, 0);
+-- The same conditions as the DELETE / INSERT below, recorded so the result can say whether it
+-- is repeatable (@cache): a call that changes kept values must not be answered from cache.
+UPDATE lookup SET writes = override IS NULL AND (
+  (sticky IS NOT NULL AND (NOT :keep OR (NOT latest_exp_active AND NOT coalesce(is_experiment_active, 0))))
+  OR (:keep AND is_experiment_active AND is_user_in_experiment AND entity_name IS NOT NULL
+      AND (sticky IS NULL OR NOT latest_exp_active)));
 -- drop the kept value: not wanted, or neither the kept nor the latest experiment is active
 DELETE FROM sticky_value
   WHERE name_hash = (SELECT name_hash FROM lookup)
@@ -477,23 +499,28 @@ UPDATE lookup SET reason = CASE
     WHEN entity_name IS NOT NULL THEN 'Recognized'
     ELSE 'Unrecognized' END
   WHERE reason = '';
-SELECT * FROM lookup_result;
+SELECT r.*, NOT l.writes AS _cacheable FROM lookup_result AS r, lookup AS l;
 
 
 -- name: override_set
+-- @writes: values
 -- Overrides apply to this client right away and are persisted for the next start.
 INSERT OR REPLACE INTO override (kind, name, value) VALUES (:kind, :name, :value);
 INSERT OR REPLACE INTO local_override (kind, name, value) VALUES (:kind, :name, :value);
 
 -- name: override_remove
+-- @writes: values
 DELETE FROM override WHERE name = :name;
 DELETE FROM local_override WHERE name = :name;
 
 -- name: override_clear
+-- @writes: values
 DELETE FROM override;
 DELETE FROM local_override;
 
 -- name: overrides
+-- @cache
+-- @reads: values
 SELECT kind, name, value FROM override ORDER BY kind, name;
 
 
@@ -502,6 +529,7 @@ SELECT kind, name, value FROM override ORDER BY kind, name;
 SELECT NOT EXISTS (SELECT 1 FROM setting WHERE key = 'legacy_imported') AS pending;
 
 -- name: legacy_import
+-- @writes: values
 -- One-time import from the SharedPreferences-based SDK: the stable ID (so upgraded devices keep
 -- their identity), local overrides ({"gates": .., "configs": .., "layers": ..}) and device-based
 -- sticky experiments ({name hash: experiment}). Cached values are simply fetched again.

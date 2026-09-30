@@ -57,7 +57,7 @@ internal fun Row.toFeatureGate(): FeatureGate {
             string("group_name"),
             jsonExposures(string("secondary_exposures")),
             string("id_type")
-        )
+        ).also { it.secondaryExposuresJson = string("secondary_exposures") ?: "[]" }
     }
 }
 
@@ -79,7 +79,7 @@ internal fun Row.toDynamicConfig(): DynamicConfig {
             bool("is_device_based"),
             string("allocated_experiment_name"),
             long("rule_passed")?.let { it != 0L }
-        )
+        ).also { it.secondaryExposuresJson = string("secondary_exposures") ?: "[]" }
     }
 }
 

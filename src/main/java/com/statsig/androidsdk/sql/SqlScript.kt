@@ -6,12 +6,35 @@ package com.statsig.androidsdk.sql
  * Format (see 00_schema.sql): `-- name: <block>` starts a block, a statement ends with `;` at the
  * end of a line (CREATE TRIGGER statements end at a line `END;`), and parameters are `:name`.
  * Parameters are rewritten to `?` so that any SQLite binding can run the statements.
+ * `-- @...` lines declare how a host may run the block (see [Block]).
  */
-internal class SqlScript private constructor(val blocks: Map<String, List<Statement>>) {
+internal class SqlScript private constructor(val blocks: Map<String, Block>) {
 
     class Statement(val sql: String, val params: List<String>, val returnsRows: Boolean)
 
-    fun block(name: String): List<Statement> =
+    /**
+     * A named block and its directives:
+     * `@reads: a, b` / `@writes: a, b` name the data it depends on / changes;
+     * `@cache`: its result may be reused until a block writing what it reads runs (a result row
+     * with `_cacheable` = 0 opts a single call out, and counts as a write);
+     * `@defer`: calls may be queued and run later, in order, in one transaction (row-returning
+     * statements then run once, after the last queued call; calls also get `:time`);
+     * `@coalesce`: queued calls with identical parameters may be merged (`repeat` counts them);
+     * `@quiet: <ms>`: after a call that changed rows, identical calls made within <ms> change
+     * nothing, as long as nothing the block reads is written in between (so they may be skipped).
+     */
+    class Block(
+        val name: String,
+        val statements: List<Statement>,
+        val reads: Set<String>,
+        val writes: Set<String>,
+        val cache: Boolean,
+        val defer: Boolean,
+        val coalesce: Boolean,
+        val quietMs: Long? = null
+    )
+
+    fun block(name: String): Block =
         blocks[name] ?: throw IllegalArgumentException("Unknown SQL block: $name")
 
     companion object {
@@ -24,6 +47,7 @@ internal class SqlScript private constructor(val blocks: Map<String, List<Statem
             "05_evaluator.sql"
         )
         private val BLOCK_HEADER = Regex("^-- name: (\\S+)\\s*$")
+        private val DIRECTIVE = Regex("^-- @(\\w+)(?::\\s*(.*))?$")
         private val CREATE_TRIGGER = Regex("^CREATE\\s+(TEMP\\s+)?TRIGGER", RegexOption.IGNORE_CASE)
         private val RETURNS_ROWS = Regex("^(SELECT|WITH|VALUES)\\b", RegexOption.IGNORE_CASE)
 
@@ -38,28 +62,34 @@ internal class SqlScript private constructor(val blocks: Map<String, List<Statem
         }
 
         fun parse(sources: List<String>): SqlScript {
-            val blocks = LinkedHashMap<String, MutableList<Statement>>()
+            val statements = LinkedHashMap<String, MutableList<Statement>>()
+            val directives = HashMap<String, MutableMap<String, String>>()
             for (source in sources) {
                 var block: String? = null
                 val current = ArrayList<String>()
                 fun finish() {
                     val sql = current.joinToString("\n").trim()
                     current.clear()
-                    if (sql.isNotEmpty()) blocks.getOrPut(block!!) { ArrayList() }.add(compile(sql))
+                    if (sql.isNotEmpty()) {
+                        statements.getOrPut(block!!) { ArrayList() }.add(compile(sql))
+                    }
                 }
                 for (line in source.lines()) {
                     val header = BLOCK_HEADER.find(line)
                     if (header != null) {
                         finish()
                         block = header.groupValues[1]
+                        statements.getOrPut(block) { ArrayList() }
                         continue
                     }
                     if (block == null) continue
-                    // comments between statements are not part of any statement
-                    if (current.isEmpty() &&
-                        (line.isBlank() || line.trimStart().startsWith("--"))
-                    ) {
-                        continue
+                    if (current.isEmpty()) {
+                        DIRECTIVE.find(line.trim())?.let {
+                            directives.getOrPut(block) { HashMap() }[it.groupValues[1]] =
+                                it.groupValues[2]
+                        }
+                        // comments between statements are not part of any statement
+                        if (line.isBlank() || line.trimStart().startsWith("--")) continue
                     }
                     current.add(line)
                     val isTrigger = CREATE_TRIGGER.containsMatchIn(current.first().trimStart())
@@ -72,7 +102,24 @@ internal class SqlScript private constructor(val blocks: Map<String, List<Statem
                 }
                 finish()
             }
-            return SqlScript(blocks)
+            return SqlScript(
+                statements.mapValues { (name, list) ->
+                    val d = directives[name] ?: emptyMap()
+                    fun set(key: String) =
+                        d[key]?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }?.toSet()
+                            ?: emptySet()
+                    Block(
+                        name,
+                        list,
+                        set("reads"),
+                        set("writes"),
+                        "cache" in d,
+                        "defer" in d,
+                        "coalesce" in d,
+                        d["quiet"]?.trim()?.toLong()
+                    )
+                }
+            )
         }
 
         /** Replaces `:name` parameters (outside quotes and comments) with `?`. */

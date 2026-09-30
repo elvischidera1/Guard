@@ -231,6 +231,14 @@ class DynamicConfig(
         else -> null
     }
 
+    /** getSecondaryExposures() as JSON, when this config came from the SDK's SQL. */
+    @Transient
+    internal var secondaryExposuresJson: String? = null
+
+    /** Parameters of this config's automatic exposure, built on first use. */
+    @Transient
+    internal var exposureParams: Map<String, Any?>? = null
+
     /**
      * Returns a Map representing the JSON object backing this config
      * @param key the index within the DynamicConfig to fetch a value from

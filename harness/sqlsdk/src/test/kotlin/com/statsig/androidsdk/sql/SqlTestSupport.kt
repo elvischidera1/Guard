@@ -15,6 +15,12 @@ internal fun StatsigDb.exec(sql: String, vararg args: Any?) {
     (driverField.get(this) as SqlDriver).execute(sql, args.toList())
 }
 
+/** Drops the host's cached results (for tests that change tables behind the blocks' backs). */
+internal fun StatsigDb.forgetCaches() {
+    val field = StatsigDb::class.java.getDeclaredField("cache").apply { isAccessible = true }
+    (field.get(this) as MutableMap<*, *>).clear()
+}
+
 internal fun StatsigDb.scalar(sql: String, vararg args: Any?): Any? {
     val driverField = StatsigDb::class.java.getDeclaredField("driver").apply { isAccessible = true }
     return (driverField.get(this) as SqlDriver).query(sql, args.toList()).firstOrNull()?.values?.firstOrNull()

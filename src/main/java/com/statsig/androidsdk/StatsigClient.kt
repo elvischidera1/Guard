@@ -212,6 +212,8 @@ class StatsigClient : LifecycleEventListener {
             )
         )
         importLegacyStorage()
+        // flush when the SQL says the event queue is full
+        db.onShouldFlush = { statsigScope.launch(dispatcherProvider.io) { flushEvents() } }
         diagnostics = Diagnostics(db)
         diagnostics.markStart(KeyType.OVERALL, ContextType.INITIALIZE)
 
@@ -445,19 +447,19 @@ class StatsigClient : LifecycleEventListener {
         errorBoundary.capture(
             {
                 db.run("count_non_exposed", mapOf("name" to parameterStoreName))
-                val row = db.one(
+                val (parameters, details) = db.read(
                     "get_value",
-                    mapOf(
-                        "kind" to "param_store",
-                        "name" to parameterStoreName
-                    )
-                )!!
+                    mapOf("kind" to "param_store", "name" to parameterStoreName)
+                ) { rows ->
+                    jsonParamStore(rows.first().string("value")) to
+                        rows.first().evalDetails()
+                }
                 paramStore =
                     ParameterStore(
                         this,
-                        jsonParamStore(row.string("value")),
+                        parameters,
                         parameterStoreName,
-                        row.evalDetails(),
+                        details,
                         options
                     )
                 paramStore = onDeviceEvalAdapter?.getParamStore(this, paramStore) ?: paramStore
@@ -533,18 +535,16 @@ class StatsigClient : LifecycleEventListener {
     }
 
     private fun getFeatureGateEvaluation(gateName: String): FeatureGate {
-        val gate = db.one(
-            "get_value",
-            mapOf("kind" to "gate", "name" to gateName)
-        )!!.toFeatureGate()
+        val gate = db.read("get_value", mapOf("kind" to "gate", "name" to gateName)) {
+            it.first().toFeatureGate()
+        }
         return onDeviceEvalAdapter?.getGate(gate, user) ?: gate
     }
 
     private fun getDynamicConfigEvaluation(configName: String): DynamicConfig {
-        val config = db.one(
-            "get_value",
-            mapOf("kind" to "config", "name" to configName)
-        )!!.toDynamicConfig()
+        val config = db.read("get_value", mapOf("kind" to "config", "name" to configName)) {
+            it.first().toDynamicConfig()
+        }
         return onDeviceEvalAdapter?.getDynamicConfig(config, user) ?: config
     }
 
@@ -552,10 +552,10 @@ class StatsigClient : LifecycleEventListener {
         experimentName: String,
         keepDeviceValue: Boolean
     ): DynamicConfig {
-        val experiment = db.one(
+        val experiment = db.read(
             "get_experiment",
             mapOf("name" to experimentName, "kind" to "config", "keep" to keepDeviceValue)
-        )!!.toDynamicConfig()
+        ) { it.first().toDynamicConfig() }
         return onDeviceEvalAdapter?.getDynamicConfig(experiment, user) ?: experiment
     }
 
@@ -564,10 +564,16 @@ class StatsigClient : LifecycleEventListener {
         layerName: String,
         keepDeviceValue: Boolean
     ): Layer {
-        val layer = db.one(
+        // "logs" is not a SQL parameter: it keeps cached layers with and without a client apart
+        val layer = db.read(
             "get_experiment",
-            mapOf("name" to layerName, "kind" to "layer", "keep" to keepDeviceValue)
-        )!!.toLayer(client)
+            mapOf(
+                "name" to layerName,
+                "kind" to "layer",
+                "keep" to keepDeviceValue,
+                "logs" to (client != null)
+            )
+        ) { it.first().toLayer(client) }
         return onDeviceEvalAdapter?.getLayer(client, layer, user) ?: layer
     }
 
@@ -629,15 +635,13 @@ class StatsigClient : LifecycleEventListener {
         errorBoundary.capture(
             {
                 val statsigMetadata = eventMetadata()
-                queued(
-                    db.one(
-                        "log_event",
-                        mapOf(
-                            "event_name" to eventName,
-                            "value" to toJson(value),
-                            "metadata" to toJson(metadata),
-                            "statsig_metadata" to toJson(statsigMetadata)
-                        )
+                db.run(
+                    "log_event",
+                    mapOf(
+                        "event_name" to eventName,
+                        "value" to toJson(value),
+                        "metadata" to toJson(metadata),
+                        "statsig_metadata" to toJson(statsigMetadata)
                     )
                 )
             },
@@ -646,40 +650,51 @@ class StatsigClient : LifecycleEventListener {
     }
 
     private fun logGateExposure(gate: FeatureGate, isManual: Boolean) {
+        val params = if (isManual) {
+            gateExposure(gate, true)
+        } else {
+            gate.exposureParams ?: gateExposure(gate, false).also { gate.exposureParams = it }
+        }
+        db.run("log_gate_exposure", params)
+    }
+
+    private fun gateExposure(gate: FeatureGate, isManual: Boolean): Map<String, Any?> {
         val details = gate.getEvalDetails()
-        queued(
-            db.one(
-                "log_gate_exposure",
-                mapOf(
-                    "name" to gate.getName(),
-                    "value" to gate.getValue(),
-                    "rule_id" to gate.getRuleID(),
-                    "secondary" to toJson(gate.getSecondaryExposures()),
-                    "reason" to details.getDetailedReasonString(),
-                    "lcut" to details.lcut,
-                    "received_at" to details.receivedAt,
-                    "manual" to isManual
-                )
-            )
+        return mapOf(
+            "name" to gate.getName(),
+            "value" to gate.getValue(),
+            "rule_id" to gate.getRuleID(),
+            "secondary" to (gate.secondaryExposuresJson ?: toJson(gate.getSecondaryExposures())),
+            "reason" to details.getDetailedReasonString(),
+            "lcut" to details.lcut,
+            "received_at" to details.receivedAt,
+            "manual" to isManual
         )
     }
 
     private fun logConfigExposure(config: DynamicConfig, isManual: Boolean) {
+        val params = if (isManual) {
+            configExposure(config, true)
+        } else {
+            config.exposureParams ?: configExposure(config, false).also {
+                config.exposureParams = it
+            }
+        }
+        db.run("log_config_exposure", params)
+    }
+
+    private fun configExposure(config: DynamicConfig, isManual: Boolean): Map<String, Any?> {
         val details = config.getEvalDetails()
-        queued(
-            db.one(
-                "log_config_exposure",
-                mapOf(
-                    "name" to config.getName(),
-                    "rule_id" to config.getRuleID(),
-                    "secondary" to toJson(config.getSecondaryExposures()),
-                    "reason" to details.getDetailedReasonString(),
-                    "lcut" to details.lcut,
-                    "received_at" to details.receivedAt,
-                    "rule_passed" to config.getRulePassed(),
-                    "manual" to isManual
-                )
-            )
+        return mapOf(
+            "name" to config.getName(),
+            "rule_id" to config.getRuleID(),
+            "secondary" to
+                (config.secondaryExposuresJson ?: toJson(config.getSecondaryExposures())),
+            "reason" to details.getDetailedReasonString(),
+            "lcut" to details.lcut,
+            "received_at" to details.receivedAt,
+            "rule_passed" to config.getRulePassed(),
+            "manual" to isManual
         )
     }
 
@@ -695,22 +710,38 @@ class StatsigClient : LifecycleEventListener {
     }
 
     private fun queueLayerExposure(layer: Layer, parameterName: String, isManual: Boolean) {
+        val params = if (isManual) {
+            layerExposure(layer, parameterName, true)
+        } else {
+            layer.exposureParams().getOrPut(parameterName) {
+                layerExposure(layer, parameterName, false)
+            }
+        }
+        db.run("log_layer_exposure", params)
+    }
+
+    private fun layerExposure(
+        layer: Layer,
+        parameterName: String,
+        isManual: Boolean
+    ): Map<String, Any?> {
         val details = layer.getEvalDetails()
-        queued(
-            db.one(
-                "log_layer_exposure",
-                mapOf(
-                    "name" to layer.getName(),
-                    "rule_id" to layer.getRuleIDForParameter(parameterName),
-                    "parameter" to parameterName,
-                    "explicit" to toJson(layer.getExplicitParameters()),
-                    "allocated" to layer.getAllocatedExperimentName(),
-                    "secondary" to toJson(layer.getSecondaryExposures()),
-                    "undelegated" to toJson(layer.getUndelegatedSecondaryExposures()),
-                    "reason" to details.getDetailedReasonString(),
-                    "received_at" to details.receivedAt, "manual" to isManual
-                )
-            )
+        val json = layer.exposureJson ?: Layer.ExposureJson(
+            toJson(layer.getExplicitParameters()),
+            toJson(layer.getSecondaryExposures()),
+            toJson(layer.getUndelegatedSecondaryExposures())
+        ).also { layer.exposureJson = it }
+        return mapOf(
+            "name" to layer.getName(),
+            "rule_id" to layer.getRuleIDForParameter(parameterName),
+            "parameter" to parameterName,
+            "explicit" to json.explicit,
+            "allocated" to layer.getAllocatedExperimentName(),
+            "secondary" to json.secondary,
+            "undelegated" to json.undelegated,
+            "reason" to details.getDetailedReasonString(),
+            "received_at" to details.receivedAt,
+            "manual" to isManual
         )
     }
 
@@ -777,15 +808,6 @@ class StatsigClient : LifecycleEventListener {
     private fun manualExposure(functionName: String, name: String, log: () -> Unit) {
         enforceInitialized(functionName)
         errorBoundary.capture(log, tag = functionName, configName = name)
-    }
-
-    /** Flushes when the SQL says the queue is full. */
-    private fun queued(row: Row?) {
-        if (row?.bool("should_flush") ==
-            true
-        ) {
-            statsigScope.launch(dispatcherProvider.io) { flushEvents() }
-        }
     }
 
     private suspend fun flushEvents() {

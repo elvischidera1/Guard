@@ -15,8 +15,21 @@ tasks.register<JavaExec>("bench") {
     description = "Runs the public-API benchmark."
     classpath = testSourceSet.runtimeClasspath
     mainClass.set("harness.BenchmarkKt")
-    jvmArgs("-Xms1g", "-Xmx1g")
+    // Pre-touch the heap: otherwise first-touch page faults on fresh heap pages make
+    // allocation-heavy loops several times slower until the heap has been cycled once.
+    jvmArgs("-Xms1g", "-Xmx1g", "-XX:+AlwaysPreTouch")
+    // e.g. -PbenchJvmArgs=-XX:StartFlightRecording=filename=bench.jfr to profile
+    providers.gradleProperty("benchJvmArgs").orNull?.let { jvmArgs(it.split(' ')) }
     args(layout.buildDirectory.file("bench.json").get().asFile.path)
 }
 
 
+
+tasks.register<JavaExec>("probe") {
+    group = "harness"
+    description = "Runs -Pmain=<class> from the test classpath (ad-hoc measurements)."
+    classpath = testSourceSet.runtimeClasspath
+    mainClass.set(providers.gradleProperty("main"))
+    jvmArgs("-Xms1g", "-Xmx1g")
+    providers.gradleProperty("benchJvmArgs").orNull?.let { jvmArgs(it.split(' ')) }
+}
