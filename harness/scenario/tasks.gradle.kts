@@ -20,7 +20,9 @@ tasks.register<JavaExec>("bench") {
     jvmArgs("-Xms1g", "-Xmx1g", "-XX:+AlwaysPreTouch")
     // e.g. -PbenchJvmArgs=-XX:StartFlightRecording=filename=bench.jfr to profile
     providers.gradleProperty("benchJvmArgs").orNull?.let { jvmArgs(it.split(' ')) }
-    args(layout.buildDirectory.file("bench.json").get().asFile.path)
+    // -PbenchOut=<file>: where to write the results (default build/bench.json)
+    args(providers.gradleProperty("benchOut").orNull
+        ?: layout.buildDirectory.file("bench.json").get().asFile.path)
 }
 
 
