@@ -1,110 +1,76 @@
 package com.statsig.androidsdk
 
-import android.os.SystemClock
-import java.util.Queue
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.ConcurrentLinkedQueue
+import com.statsig.androidsdk.sql.StatsigDb
 
-const val NANO_IN_MS = 1_000_000.0
-internal class Diagnostics(val statsigOptionsLoggingCopy: Map<String, Any?>) {
-    companion object {
-        fun formatFailedResponse(
-            failResponse: InitializeResponse.FailedInitializeResponse
-        ): Marker.ErrorMessage {
-            val name = failResponse.exception?.javaClass?.toString() ?: "unknown"
-            val message = "${failResponse.reason} : ${failResponse.exception?.message}"
-            return Marker.ErrorMessage(message = message, name = name)
-        }
-    }
-    var diagnosticsContext: ContextType = ContextType.INITIALIZE
-    private var defaultMaxMarkers: Int = 30
-
-    private var maxMarkers: MutableMap<ContextType, Int> = mutableMapOf(
-        ContextType.INITIALIZE to this.defaultMaxMarkers,
-        ContextType.UPDATE_USER to this.defaultMaxMarkers
-    )
-
-    private var markers = ConcurrentHashMap<ContextType, ConcurrentLinkedQueue<Marker>>()
-
-    fun getMarkers(context: ContextType? = null): Queue<Marker> =
-        this.markers[context ?: this.diagnosticsContext] ?: ConcurrentLinkedQueue()
-
-    fun clearContext(context: ContextType? = null) {
-        this.markers.put(context ?: this.diagnosticsContext, ConcurrentLinkedQueue())
-    }
+/** Records diagnostics markers; storing, capping and turning them into events is SQL. */
+internal class Diagnostics(private val db: StatsigDb) {
+    private val gson = StatsigUtil.getOrBuildGson()
 
     fun markStart(
         key: KeyType,
+        context: ContextType,
         step: StepType? = null,
-        additionalMarker: Marker? = null,
-        overrideContext: ContextType? = null
-    ): Boolean {
-        val context = overrideContext ?: this.diagnosticsContext
-        if (this.defaultMaxMarkers < (this.markers[context]?.size ?: 0)) {
-            return false
-        }
-        val marker = Marker(
-            key = key,
-            action = ActionType.START,
-            timestamp =
-            SystemClock.elapsedRealtimeNanos() / NANO_IN_MS,
-            step = step
-        )
-        when (context) {
-            ContextType.INITIALIZE, ContextType.UPDATE_USER -> {
-                if (key == KeyType.INITIALIZE && step == StepType.NETWORK_REQUEST) {
-                    marker.attempt = additionalMarker?.attempt
-                }
-            }
-        }
-
-        return this.addMarker(marker, context)
-    }
+        attempt: Int? = null
+    ) = mark(context, key, ActionType.START, step, attempt = attempt)
 
     fun markEnd(
         key: KeyType,
+        context: ContextType,
         success: Boolean,
         step: StepType? = null,
-        additionalMarker: Marker? = null,
-        overrideContext: ContextType? = null
-    ): Boolean {
-        val context = overrideContext ?: this.diagnosticsContext
-        if (this.defaultMaxMarkers < (this.markers[context]?.size ?: 0)) {
-            return false
-        }
-        val marker = Marker(
-            key = key,
-            action = ActionType.END,
-            timestamp =
-            SystemClock.elapsedRealtimeNanos() / NANO_IN_MS,
-            success = success,
-            step = step
+        evaluationDetails: EvalDetails? = null,
+        attempt: Int? = null,
+        sdkRegion: String? = null,
+        statusCode: Int? = null,
+        error: Marker.ErrorMessage? = null,
+        hasNetwork: Boolean? = null
+    ) = mark(
+        context, key, ActionType.END, step, success, attempt, sdkRegion, statusCode, error,
+        hasNetwork, evaluationDetails
+    )
+
+    fun logDiagnostics(context: ContextType): Boolean =
+        db.one("log_diagnostics", mapOf("context" to wire(context)))?.bool("should_flush") == true
+
+    private fun mark(
+        context: ContextType,
+        key: KeyType,
+        action: ActionType,
+        step: StepType?,
+        success: Boolean? = null,
+        attempt: Int? = null,
+        sdkRegion: String? = null,
+        statusCode: Int? = null,
+        error: Marker.ErrorMessage? = null,
+        hasNetwork: Boolean? = null,
+        evaluationDetails: EvalDetails? = null
+    ) {
+        db.run(
+            "mark",
+            mapOf(
+                "context" to wire(context),
+                "key" to wire(key),
+                "action" to wire(action),
+                "step" to step?.let { wire(it) },
+                "success" to success,
+                "attempt" to attempt,
+                "sdk_region" to sdkRegion,
+                "status_code" to statusCode,
+                "error" to error?.let { gson.toJson(it) },
+                "has_network" to hasNetwork,
+                "evaluation_details" to evaluationDetails?.let { gson.toJson(it.toLoggingEvaluationDetails()) }
+            )
         )
-        when (context) {
-            ContextType.INITIALIZE, ContextType.UPDATE_USER -> {
-                marker.evaluationDetails = additionalMarker?.evaluationDetails
-                marker.attempt = additionalMarker?.attempt
-                marker.sdkRegion = additionalMarker?.sdkRegion
-                marker.statusCode = additionalMarker?.statusCode
-                marker.error = additionalMarker?.error
-            }
-        }
-        if (step == StepType.NETWORK_REQUEST) {
-            marker.hasNetwork = additionalMarker?.hasNetwork
-        }
-        return this.addMarker(marker, context)
     }
 
-    private fun addMarker(marker: Marker, overrideContext: ContextType? = null): Boolean {
-        val context = overrideContext ?: this.diagnosticsContext
-        if (this.defaultMaxMarkers <= (this.markers[context]?.size ?: 0)) {
-            return false
-        }
-        if (this.markers[context] == null) {
-            this.markers[context] = ConcurrentLinkedQueue()
-        }
-        this.markers[context]?.add(marker)
-        this.markers.values
-        return true
+    /** The enum's wire name, e.g. "update_user". */
+    private fun wire(value: Enum<*>): String = gson.toJson(value).trim('"')
+
+    companion object {
+        fun formatFailedResponse(failure: InitializeResponse.FailedInitializeResponse): Marker.ErrorMessage =
+            Marker.ErrorMessage(
+                message = "${failure.reason} : ${failure.exception?.message}",
+                name = failure.exception?.javaClass?.toString() ?: "unknown"
+            )
     }
 }

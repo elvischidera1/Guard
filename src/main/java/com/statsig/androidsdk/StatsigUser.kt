@@ -1,6 +1,5 @@
 package com.statsig.androidsdk
 
-import com.google.gson.Gson
 import com.google.gson.annotations.SerializedName
 
 internal const val STATSIG_NULL_USER: String = "Statsig.NULL_USER"
@@ -25,9 +24,6 @@ data class StatsigUser(
     @SerializedName("userID")
     var userID: String? = null
 ) {
-    @Transient
-    private var memoizedHashJson: String? = null
-
     @SerializedName("email")
     var email: String? = null
 
@@ -73,23 +69,6 @@ data class StatsigUser(
         return userCopy
     }
 
-    internal fun getCopyForLogging(): StatsigUser {
-        val userCopy = StatsigUser(userID)
-        userCopy.email = email
-        userCopy.ip = ip
-        userCopy.userAgent = userAgent
-        userCopy.country = country
-        userCopy.locale = locale
-        userCopy.appVersion = appVersion
-        userCopy.custom = custom
-        userCopy.statsigEnvironment = statsigEnvironment
-        userCopy.customIDs = customIDs
-        // DO NOT copy privateAttributes to the logging copy!
-        userCopy.privateAttributes = null
-
-        return userCopy
-    }
-
     fun getCacheKey(): String {
         val id = StringBuilder(userID ?: STATSIG_NULL_USER)
 
@@ -97,12 +76,5 @@ data class StatsigUser(
             id.append(k).append(":").append(v)
         }
         return id.toString()
-    }
-
-    internal fun toHashString(gson: Gson): String {
-        // This memoization is safe because the sdk maintains its own StatsigUser instance
-        // (copying the external values) and does not mutate it
-        val hashJson = memoizedHashJson ?: gson.toJson(this).also { memoizedHashJson = it }
-        return Hashing.getHashedString(hashJson, HashAlgorithm.DJB2)
     }
 }

@@ -199,6 +199,13 @@ class Scenario(private val app: HarnessApp = HarnessApp(), val server: FakeServe
         val v1ok = gson.fromJson(bootstrapV1("user-boot3"), Map::class.java) as Map<String, Any>
         Statsig.updateUser(StatsigUser("user-boot3").apply { customIDs = mapOf("companyID" to "c1", "stableID" to "ignored") }, v1ok)
         record("p4.v1.valid", rec(Statsig.getFeatureGate("boot_gate")))
+        for (declared in listOf(true, false)) {
+            val sha = gson.fromJson(bootstrapSha256("user-sha", declared), Map::class.java) as Map<String, Any>
+            Statsig.updateUser(StatsigUser("user-sha"), sha)
+            record("p4.sha256.$declared.gate", rec(Statsig.getFeatureGate("sha_gate")))
+            record("p4.sha256.$declared.config", rec(Statsig.getExperiment("sha_config", true)))
+            record("p4.sha256.$declared.missing", rec(Statsig.getFeatureGate("nope")))
+        }
         flushAndRecord("p4")
         recordInits("p4.initRequests")
 
@@ -278,18 +285,19 @@ class Scenario(private val app: HarnessApp = HarnessApp(), val server: FakeServe
         server.initStatus = 200
         server.initBody = responseA()
         val adapter = OnDeviceEvalAdapter(DcsFixture.json(1_800_000_000_000))
-        val users = (0..9).map { i ->
+        val users = (0..39).map { i ->
             StatsigUser("user-$i").apply {
-                email = listOf("a@example.com", "x@corp.com", "B@X.IO", null, "c@corp.com")[i % 5]
-                appVersion = listOf("2.10.2", "1.2.0", "0.9", "1.0.0-rc1", "2.10.1", null)[i % 6]
+                email = listOf("a@example.com", "x@corp.com", "B@X.IO", null, "c@corp.com", "")[i % 6]
+                appVersion = listOf("2.10.2", "1.2.0", "0.9", "1.0.0-rc1", "2.10.1", null, "1.x", "2.11")[i % 8]
                 country = listOf("US", "NG", null)[i % 3]
                 custom = mapOf(
-                    "level" to listOf(1, 2.0, 3, "4", 6.5, "abc")[i % 6],
-                    "tier" to listOf("Bronze", "bronze", "gold", "xenon")[i % 4],
+                    "level" to listOf(1, 2.0, 3, "4", 6.5, "abc", true, " 5")[i % 8],
+                    "tier" to listOf("Bronze", "bronze", "gold", "xenon", "")[i % 5],
                     "beta" to (i % 2 == 0),
-                    "signupAt" to listOf("2024-03-05T23:59:59.000Z", 1709633000000L, "1709633000", "garbage")[i % 4]
+                    "signupAt" to listOf("2024-03-05T23:59:59.000Z", 1709633000000L, "1709633000", "garbage", 1709633000)[i % 5]
                 )
                 customIDs = mapOf("companyID" to "c${i % 4}")
+                if (i % 7 == 3) privateAttributes = mapOf("level" to 9, "email" to "p@corp.com")
             }
         }
         users.forEachIndexed { i, u ->

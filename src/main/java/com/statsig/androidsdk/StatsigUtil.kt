@@ -11,20 +11,5 @@ internal object StatsigUtil {
             .create()
     }
 
-    fun normalizeUser(user: Map<String, Any>?): Map<String, Any>? {
-        if (user == null) {
-            return null
-        }
-        return user.filterValues { value ->
-            if (value is Array<*>) {
-                value.size == (value.filter { it is String }).size
-            } else {
-                value is String ||
-                    value is Boolean ||
-                    value is Double
-            }
-        }
-    }
-
     internal fun getOrBuildGson(): Gson = gson
 }

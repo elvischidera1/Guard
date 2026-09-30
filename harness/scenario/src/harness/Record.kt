@@ -100,6 +100,18 @@ fun rec(b: BaseConfig) = "${b.javaClass.simpleName}:${b.getName()}"
 
 private val TIMESTAMP = Regex("^\\d{10,}$")
 
+/**
+ * The markers of the last overall start..end run. The original SDK never clears update_user
+ * markers, so each update re-sends all earlier ones (fixed in the SQL version); comparing the
+ * latest run keeps both transcripts comparable.
+ */
+private fun lastRun(markers: List<com.google.gson.JsonElement>): List<com.google.gson.JsonElement> {
+    val start = markers.indexOfLast {
+        it.asJsonObject.get("key")?.asString == "overall" && it.asJsonObject.get("action")?.asString == "start"
+    }
+    return if (start <= 0) markers else markers.subList(start, markers.size)
+}
+
 /** Strips run-dependent parts (times, ids) from a log_event request. */
 fun normalizeLogRequest(request: Map<String, Any?>): List<String> {
     @Suppress("UNCHECKED_CAST")
@@ -112,13 +124,15 @@ fun normalizeLogRequest(request: Map<String, Any?>): List<String> {
         if (meta != null) {
             meta.replaceAll { k, v ->
                 when {
-                    k == "markers" && v is String -> JsonParser.parseString(v).asJsonArray.map { mk ->
+                    k == "markers" && v is String -> lastRun(JsonParser.parseString(v).asJsonArray.toList()).map { mk ->
                         val o = mk.asJsonObject
                         listOf("key", "action", "step", "success", "attempt", "statusCode", "isBlocking")
                             .mapNotNull { f -> o.get(f)?.let { "$f=${it.asString}" } }.joinToString(",") +
                             (o.getAsJsonObject("evaluationDetails")?.get("reason")?.let { ",reason=${it.asString}" } ?: "")
                     }
                     k == "statsigOptions" && v is String -> "<options>"
+                    // an encoded JSON map whose key order is not meaningful
+                    k == "checks" && v is String -> canonJson(gson.fromJson(v, Map::class.java))
                     v is String && TIMESTAMP.matches(v) -> "<ts>"
                     else -> v
                 }

@@ -7,4 +7,4 @@ dependencyResolutionManagement {
     repositories { mavenCentral() }
 }
 
-include(":shims", ":baseline")
+include(":shims", ":baseline", ":sqlsdk")

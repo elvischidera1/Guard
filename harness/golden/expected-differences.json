@@ -1,0 +1,3 @@
+{
+  "p4.events": "The original SDK never clears update_user diagnostics markers. After a few updateUser calls it reaches its 30-marker cap, stops recording, and re-sends the same stale markers on every later update (here: the network update from phase 3 instead of the two bootstrap updates). The SQL version clears the markers it has logged, so each update reports its own markers."
+}

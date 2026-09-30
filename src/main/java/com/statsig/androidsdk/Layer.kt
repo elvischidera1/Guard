@@ -1,7 +1,5 @@
 package com.statsig.androidsdk
 
-import com.statsig.androidsdk.evaluator.ConfigEvaluation
-
 /**
  * A helper class for interfacing with Layers defined in the Statsig console
  */
@@ -21,49 +19,6 @@ class Layer internal constructor(
     private val explicitParameters: Set<String>? = null,
     private val parameterRuleIDs: Map<String, String>? = null
 ) : BaseConfig(name, details) {
-    internal constructor(
-        client: StatsigClient?,
-        layerName: String,
-        apiDynamicConfig: APIDynamicConfig,
-        evalDetails: EvalDetails
-    ) : this(
-        client,
-        layerName,
-        evalDetails,
-        apiDynamicConfig.value,
-        apiDynamicConfig.ruleID,
-        apiDynamicConfig.groupName,
-        apiDynamicConfig.secondaryExposures ?: arrayOf(),
-        apiDynamicConfig.undelegatedSecondaryExposures ?: arrayOf(),
-        apiDynamicConfig.isUserInExperiment,
-        apiDynamicConfig.isExperimentActive,
-        apiDynamicConfig.isDeviceBased,
-        apiDynamicConfig.allocatedExperimentName,
-        apiDynamicConfig.explicitParameters?.toSet(),
-        apiDynamicConfig.parameterRuleIDs
-    )
-
-    internal constructor(
-        client: StatsigClient?,
-        layerName: String,
-        evaluation: ConfigEvaluation,
-        details: EvalDetails
-    ) : this(
-        client = client,
-        name = layerName,
-        details = details,
-        jsonValue = evaluation.returnableValue?.mapValue ?: mapOf(),
-        rule = evaluation.ruleID,
-        groupName = evaluation.groupName,
-        secondaryExposures = evaluation.secondaryExposures.toTypedArray(),
-        undelegatedSecondaryExposures = evaluation.undelegatedSecondaryExposures.toTypedArray(),
-        isExperimentActive = evaluation.isActive,
-        isUserInExperiment = evaluation.isExperimentGroup,
-        isDeviceBased = false,
-        allocatedExperimentName = evaluation.configDelegate,
-        explicitParameters = evaluation.explicitParameters?.toSet()
-    )
-
     companion object {
         fun getError(name: String): Layer =
             Layer(null, name, EvalDetails(EvalSource.Error, EvalReason.Unrecognized, lcut = 0))

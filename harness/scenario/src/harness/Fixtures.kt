@@ -176,3 +176,21 @@ fun bootstrapV1(userId: String?) = gson.toJson(
         "evaluated_keys" to mapOf("userID" to userId, "customIDs" to mapOf("companyID" to "c1"))
     )
 )
+
+fun sha256b64(input: String): String = java.util.Base64.getEncoder().encodeToString(
+    java.security.MessageDigest.getInstance("SHA-256").digest(input.toByteArray())
+)
+
+/** Bootstrap values keyed by base64(SHA-256(name)), declared ("sha256") or implied (no hash_used). */
+fun bootstrapSha256(userId: String, declared: Boolean) = gson.toJson(
+    mapOf(
+        "feature_gates" to mapOf(sha256b64("sha_gate") to gate(sha256b64("sha_gate"), true, "sha_rule")),
+        "dynamic_configs" to mapOf(
+            sha256b64("sha_config") to config(sha256b64("sha_config"), mapOf("k" to "sha"), "sha_cfg_rule", active = true, inExperiment = true)
+        ),
+        "layer_configs" to mapOf<String, Any>(),
+        "has_updates" to true,
+        "time" to 1_690_000_000_002,
+        "evaluated_keys" to mapOf("userID" to userId)
+    ) + (if (declared) mapOf("hash_used" to "sha256") else mapOf())
+)

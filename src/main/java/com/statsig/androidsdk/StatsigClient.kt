@@ -2,149 +2,91 @@ package com.statsig.androidsdk
 
 import android.app.Application
 import android.content.Context
-import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import android.os.SystemClock
 import android.util.Log
-import androidx.annotation.VisibleForTesting
-import java.util.UUID
+import com.statsig.androidsdk.sql.AndroidSqlDriver
+import com.statsig.androidsdk.sql.Row
+import com.statsig.androidsdk.sql.SqlDriver
+import com.statsig.androidsdk.sql.StatsigDb
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
-import kotlinx.coroutines.flow.launchIn
-import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
-private const val STABLE_ID_KEY: String = "STABLE_ID"
-private const val STABLE_ID_STORE_NAME: String = "stableidstore"
+private const val DATABASE_NAME = "statsig.db"
+private const val FLUSH_INTERVAL_MS = 60_000L
+private const val MIN_POLLING_INTERVAL_MS = 60_000L
 
+/**
+ * The Statsig client. Every decision (which values apply, what is logged, what is kept on disk)
+ * is made by the SQL in resources/com/statsig/androidsdk/sql; this class exposes it through the
+ * public API and performs the I/O the SQL cannot: HTTP, timers, lifecycle callbacks.
+ */
 class StatsigClient : LifecycleEventListener {
     companion object {
         private const val TAG: String = "statsig::StatsigClient"
 
-        @VisibleForTesting
-        enum class KeyValueStorageImplementation {
-            LEGACY,
-            PREFERENCES_DATASTORE,
-            MIGRATION
+        /** Opens the SQLite database for a client. Replaceable to use another SQLite build. */
+        @JvmSynthetic
+        internal var sqlDriverFactory: (Application) -> SqlDriver = { app ->
+            AndroidSqlDriver(app.getDatabasePath(DATABASE_NAME).apply { parentFile?.mkdirs() }.path)
         }
-
-        @VisibleForTesting
-        @JvmSynthetic
-        var keyValueStorageImplementationOverride: KeyValueStorageImplementation =
-            KeyValueStorageImplementation.LEGACY
-
-        @VisibleForTesting
-        @JvmSynthetic
-        internal var keyValueStorageFactoryOverride: (
-            (
-                Application,
-                CoroutineScope
-            ) -> KeyValueStorage<String>
-        )? = null
-
-        @VisibleForTesting
-        @JvmSynthetic
-        internal fun createKeyValueStorage(
-            application: Application,
-            scope: CoroutineScope
-        ): KeyValueStorage<String> = resolveKeyValueStorageFactory().invoke(application, scope)
-
-        private fun resolveKeyValueStorageFactory(): (
-            Application,
-            CoroutineScope
-        ) -> KeyValueStorage<String> =
-            keyValueStorageFactoryOverride ?: when (keyValueStorageImplementationOverride) {
-                KeyValueStorageImplementation.LEGACY -> { app, _ -> LegacyKeyValueStorage(app) }
-                KeyValueStorageImplementation.PREFERENCES_DATASTORE -> { app, scope ->
-                    PreferencesDataStoreKeyValueStorage(app, scope)
-                }
-                KeyValueStorageImplementation.MIGRATION -> { app, scope ->
-                    val primary = PreferencesDataStoreKeyValueStorage(app, scope)
-                    MigratingKeyValueStorage(
-                        primary,
-                        LegacyKeyValueStorage(app),
-                        markerStorage = primary
-                    )
-                }
-            }
     }
-    private lateinit var store: Store
 
-    // Published across threads for evaluation/logging calls that read without a client-level lock.
+    private lateinit var db: StatsigDb
+    private lateinit var diagnostics: Diagnostics
+    private lateinit var network: StatsigNetwork
+
     @Volatile
     private lateinit var user: StatsigUser
     private lateinit var application: Application
-    private lateinit var keyValueStorage: KeyValueStorage<String>
-    private val integratedSdkExperiments = IntegratedSdkExperiments()
     private lateinit var sdkKey: String
     private lateinit var lifecycleListener: StatsigActivityLifecycleListener
-    private lateinit var logger: StatsigLogger
-
-    // This field is named `statsigClientMetadata` instead of `statsigMetadata` so
-    // @VisibleForTesting isn't transitively applied to the public getter (which returns a copy).
-    @VisibleForTesting
+    private lateinit var connectivityListener: StatsigNetworkConnectivityListener
     internal lateinit var statsigClientMetadata: StatsigMetadata
-    private lateinit var exceptionHandler: CoroutineExceptionHandler
+    internal lateinit var options: StatsigOptions
+
+    @Volatile
+    private var loggingEnabled = DEFAULT_LOGGING_ENABLED
+
+    @Volatile
+    private var eventLoggingAPI = DEFAULT_EVENT_API
     private var lifetimeCallback: IStatsigLifetimeCallback? = null
-
-    private lateinit var diagnostics: Diagnostics
-
+    private var onDeviceEvalAdapter: OnDeviceEvalAdapter? = null
     private var initTime: Long = SystemClock.elapsedRealtime()
 
-    private var dispatcherProvider = CoroutineDispatcherProvider()
+    private val dispatcherProvider = CoroutineDispatcherProvider()
     private val errorScope = CoroutineScope(SupervisorJob() + dispatcherProvider.io)
     internal var errorBoundary = ErrorBoundary(errorScope)
-
-    private var pollingJob: Job? = null
     private var statsigJob = SupervisorJob()
-    private var initialized = AtomicBoolean(false)
-    private var isBootstrapped = AtomicBoolean(false)
-    private var isInitializing = AtomicBoolean(false)
-    private var onDeviceEvalAdapter: OnDeviceEvalAdapter? = null
+    internal lateinit var statsigScope: CoroutineScope
     private val retryScope = CoroutineScope(SupervisorJob() + dispatcherProvider.io)
+    private val flushLock = Mutex()
+    private var pollingJob: Job? = null
+    private var flushTimer: Job? = null
 
+    private val initialized = AtomicBoolean(false)
+    private val isBootstrapped = AtomicBoolean(false)
+    private val isInitializing = AtomicBoolean(false)
     private val gson = StatsigUtil.getOrBuildGson()
 
-    @VisibleForTesting
-    internal lateinit var statsigScope: CoroutineScope
-
-    @VisibleForTesting
-    internal lateinit var statsigNetwork: StatsigNetwork
-
-    @VisibleForTesting
-    internal lateinit var options: StatsigOptions
-    private lateinit var runtimeMutableOptions: StatsigRuntimeMutableOptions
-
-    private lateinit var connectivityListener: StatsigNetworkConnectivityListener
-
-    private fun getInitializationDetailsSource(): EvalSource = if (this::store.isInitialized) {
-        store.getGlobalEvalDetails().source
-    } else {
-        EvalSource.Error
-    }
+    // ---------------------------------------------------------------------------------------
+    // Initialization
 
     /**
      * Initializes the SDK for the given user. Initialization is complete when the callback is
-     * invoked
-     * @param application
-     * - the Android application Statsig is operating in
-     * @param sdkKey
-     * - a client or test SDK Key from the Statsig console
-     * @param user
-     * - the user to associate with feature gate checks, config fetches, and logging
-     * @param callback
-     * - a callback to execute when initialization is complete
-     * @param options
-     * - advanced SDK setup Checking Gates/Configs before initialization calls back will return
-     * default values Logging Events before initialization will drop those events Subsequent calls to
-     * initialize will be ignored. To switch the user or update user values, use updateUser()
+     * invoked. Checking gates/configs before then returns cached or default values. Subsequent
+     * calls are ignored; use updateUser() to switch users.
      */
     fun initializeAsync(
         application: Application,
@@ -153,59 +95,32 @@ class StatsigClient : LifecycleEventListener {
         callback: IStatsigCallback? = null,
         options: StatsigOptions = StatsigOptions()
     ) {
-        val functionName = "initializeAsync"
         if (isInitializing.getAndSet(true)) {
-            Log.w(
-                TAG,
-                "initializeAsync() called on a client that is already started or starting - this is a no-op."
-            )
+            Log.w(TAG, "initializeAsync() called on a client that is already started or starting - this is a no-op.")
             return
         }
         errorBoundary.initialize(sdkKey, options.sdkErrorAPI)
         errorBoundary.capture(
             {
-                val normalizedUser = setup(application, sdkKey, user, options)
+                setup(application, sdkKey, user, options)
                 statsigScope.launch {
-                    val initDetails = setupAsync(normalizedUser)
-                    initDetails.duration = SystemClock.elapsedRealtime() - initTime
-                    // The scope's dispatcher may change in the future.
-                    // This "withContext" will ensure that initialization is complete when the
-                    // callback is invoked
+                    val details = setupAsync()
+                    details.duration = SystemClock.elapsedRealtime() - initTime
                     withContext(dispatcherProvider.main) {
                         try {
-                            callback?.onStatsigInitialize(initDetails)
-                            Log.v(TAG, "initializeAsync completed. Success: ${initDetails.success}")
-                            val failure = initDetails.failureDetails
-                            failure?.let {
-                                Log.e(TAG, "initializeAsync failure reason: ${failure.reason}")
-                                failure.exception?.let {
-                                    Log.e(
-                                        TAG,
-                                        "initializeAsync failure exception: ${failure.exception}"
-                                    )
-                                }
-                            }
+                            callback?.onStatsigInitialize(details)
+                            logInitResult("initializeAsync", details)
                         } catch (e: Exception) {
                             throw ExternalException(e.message)
                         }
                     }
                 }
             },
-            tag = functionName,
+            tag = "initializeAsync",
             recover = {
                 logEndDiagnosticsWhenException(ContextType.INITIALIZE, it)
                 try {
-                    val initDetails =
-                        InitializationDetails(
-                            duration = SystemClock.elapsedRealtime() - initTime,
-                            success = false,
-                            failureDetails = InitializeResponse.FailedInitializeResponse(
-                                InitializeFailReason.InternalError,
-                                it
-                            ),
-                            source = getInitializationDetailsSource()
-                        )
-                    callback?.onStatsigInitialize(initDetails)
+                    callback?.onStatsigInitialize(failedInitialization(it))
                 } catch (e: Exception) {
                     throw ExternalException(e.message)
                 }
@@ -213,528 +128,555 @@ class StatsigClient : LifecycleEventListener {
         )
     }
 
-    /**
-     * Initializes the SDK for the given user
-     * @param application
-     * - the Android application Statsig is operating in
-     * @param sdkKey
-     * - a client or test SDK Key from the Statsig console
-     * @param user
-     * - the user to associate with feature gate checks, config fetches, and logging
-     * @param options
-     * - advanced SDK setup
-     * @throws IllegalArgumentException if and Invalid SDK Key provided Checking Gates/Configs
-     * before initialization calls back will return default values Logging Events before
-     * initialization will drop those events Subsequent calls to initialize will be ignored. To
-     * switch the user or update user values, use updateUser()
-     */
+    /** Initializes the SDK for the given user. See [initializeAsync]. */
     suspend fun initialize(
         application: Application,
         sdkKey: String,
         user: StatsigUser? = null,
         options: StatsigOptions = StatsigOptions()
     ): InitializationDetails? {
-        val functionName = "initialize"
         if (isInitializing.getAndSet(true)) {
-            Log.w(
-                TAG,
-                "initialize() called on a client that is already started or starting - this is a no-op."
-            )
+            Log.w(TAG, "initialize() called on a client that is already started or starting - this is a no-op.")
             return null
         }
         errorBoundary.initialize(sdkKey, options.sdkErrorAPI)
         return errorBoundary.captureAsync(
-            tag = functionName,
+            tag = "initialize",
             task = {
-                val normalizedUser = setup(application, sdkKey, user, options)
-                val response = setupAsync(normalizedUser)
-                response.duration = SystemClock.elapsedRealtime() - initTime
-                Log.v(TAG, "initialize completed. Success: ${response.success}")
-                val failure = response.failureDetails
-                failure?.let {
-                    Log.e(TAG, "initialize failure reason: ${failure.reason}")
-                    failure.exception?.let {
-                        Log.e(TAG, "initialize failure exception: ${failure.exception}")
-                    }
-                }
-                return@captureAsync response
+                setup(application, sdkKey, user, options)
+                val details = setupAsync()
+                details.duration = SystemClock.elapsedRealtime() - initTime
+                logInitResult("initialize", details)
+                details
             },
             recover = {
                 logEndDiagnosticsWhenException(ContextType.INITIALIZE, it)
-                return@captureAsync InitializationDetails(
-                    duration = SystemClock.elapsedRealtime() - initTime,
-                    success = false,
-                    failureDetails = InitializeResponse.FailedInitializeResponse(
-                        InitializeFailReason.InternalError,
-                        it
+                failedInitialization(it)
+            }
+        )
+    }
+
+    private fun setup(
+        application: Application,
+        sdkKey: String,
+        user: StatsigUser?,
+        options: StatsigOptions
+    ) {
+        if (!sdkKey.startsWith("client-") && !sdkKey.startsWith("test-")) {
+            throw IllegalArgumentException(
+                "Invalid SDK Key provided.  You must provide a client SDK Key from the API Key page of your Statsig console"
+            )
+        }
+        initTime = SystemClock.elapsedRealtime()
+        HttpUtils.maybeInitializeHttpClient(application)
+        HttpUtils.addInterceptors(options.interceptors ?: emptyList())
+        this.application = application
+        this.sdkKey = sdkKey
+        this.options = options
+        this.loggingEnabled = options.loggingEnabled
+        this.eventLoggingAPI = options.eventLoggingAPI
+        this.lifetimeCallback = options.lifetimeCallback
+        this.user = normalizeUser(user)
+        statsigScope = CoroutineScope(statsigJob + dispatcherProvider.main + errorBoundary.getExceptionHandler())
+
+        db = StatsigDb(sqlDriverFactory(application))
+        db.run(
+            "session_start",
+            mapOf(
+                "sdk_key" to sdkKey,
+                "user" to userJson(),
+                "scoped_key" to scopedCacheKey(),
+                "options" to gson.toJson(options.getLoggingCopy())
+            )
+        )
+        diagnostics = Diagnostics(db)
+        diagnostics.markStart(KeyType.OVERALL, ContextType.INITIALIZE)
+
+        connectivityListener = StatsigNetworkConnectivityListener(application)
+        network = StatsigNetwork(db, sdkKey, options, connectivityListener, statsigScope, diagnostics)
+        statsigClientMetadata = if (options.optOutNonSdkMetadata) createCoreStatsigMetadata() else createStatsigMetadata()
+        populateStatsigMetadata()
+        errorBoundary.setMetadata(statsigClientMetadata)
+
+        onDeviceEvalAdapter = options.onDeviceEvalAdapter?.also { it.attach(db) }
+        initialized.set(true)
+        lifecycleListener = StatsigActivityLifecycleListener(application, this)
+        flushTimer = statsigScope.launch(dispatcherProvider.io) {
+            while (isActive) {
+                delay(FLUSH_INTERVAL_MS)
+                flushEvents()
+            }
+        }
+
+        if (!options.loadCacheAsync) {
+            diagnostics.markStart(KeyType.INITIALIZE, ContextType.INITIALIZE, StepType.LOAD_CACHE)
+            db.run("load_cache")
+            diagnostics.markEnd(KeyType.INITIALIZE, ContextType.INITIALIZE, true, StepType.LOAD_CACHE)
+        }
+        options.initializeValues?.let {
+            bootstrap(it)
+            isBootstrapped.set(true)
+        }
+    }
+
+    private suspend fun setupAsync(): InitializationDetails = withContext(dispatcherProvider.io) {
+        errorBoundary.captureAsync(
+            tag = "setupAsync",
+            task = {
+                if (isBootstrapped.get()) {
+                    val details = globalEvalDetails()
+                    diagnostics.markEnd(
+                        KeyType.OVERALL, ContextType.INITIALIZE, details.source == EvalSource.Bootstrap,
+                        evaluationDetails = details
+                    )
+                    logDiagnostics(ContextType.INITIALIZE)
+                    return@captureAsync InitializationDetails(0, true, null, details.source)
+                }
+                if (options.loadCacheAsync) {
+                    diagnostics.markStart(KeyType.INITIALIZE, ContextType.INITIALIZE, StepType.LOAD_CACHE)
+                    db.run("load_cache")
+                    diagnostics.markEnd(KeyType.INITIALIZE, ContextType.INITIALIZE, true, StepType.LOAD_CACHE)
+                }
+                val failure = if (options.initializeOffline) {
+                    null
+                } else {
+                    fetchValues(ContextType.INITIALIZE)
+                }
+                pollForUpdates()
+                if (!options.disableLogEventRetries) {
+                    retryScope.launch {
+                        try {
+                            network.retryFailedLogs(eventLoggingAPI, statsigClientMetadata)
+                        } catch (_: Exception) {
+                            // best effort
+                        }
+                    }
+                }
+                val success = failure == null
+                logEndDiagnostics(success, ContextType.INITIALIZE, failure)
+                InitializationDetails(0, success, failure, globalEvalDetails().source)
+            },
+            recover = { e ->
+                logEndDiagnosticsWhenException(ContextType.INITIALIZE, e)
+                InitializationDetails(
+                    0,
+                    false,
+                    InitializeResponse.FailedInitializeResponse(
+                        if (e is TimeoutCancellationException) InitializeFailReason.CoroutineTimeout else InitializeFailReason.InternalError,
+                        e
                     ),
-                    source = getInitializationDetailsSource()
+                    initializationSource()
                 )
             }
         )
     }
 
-    /**
-     * Check the value of a Feature Gate configured in the Statsig console for the initialized user
-     *
-     * Reads observe one internally-consistent cached-values snapshot. If this races with
-     * initialize/updateUser, it may return stale values, but not partially-applied ones.
-     *
-     * @param gateName the name of the feature gate to check
-     * @return the value of the gate for the initialized user, or false if not found
-     * @throws IllegalStateException if the SDK has not been initialized
-     */
-    fun checkGate(gateName: String): Boolean {
-        val functionName = "checkGate"
-        enforceInitialized(functionName)
-
-        var result: FeatureGate? = null
-        errorBoundary.capture(
-            {
-                val gate = getFeatureGateEvaluation(gateName)
-                logExposure(gateName, gate)
-                result = gate
-            },
-            tag = functionName,
-            configName = gateName
+    /** Fetches values for the current user and stores them. Returns the failure, if any. */
+    private suspend fun fetchValues(context: ContextType): InitializeResponse.FailedInitializeResponse? {
+        val result = network.initialize(
+            context,
+            statsigClientMetadata,
+            if (options.disableHashing == true) HashAlgorithm.NONE else HashAlgorithm.DJB2
         )
-
-        val res = result ?: FeatureGate.getError(gateName)
-        options.evaluationCallback?.invoke(res)
-        return res.getValue()
+        if (result.payload == null) {
+            db.run("network_failed")
+            return result.failure
+        }
+        diagnostics.markStart(KeyType.INITIALIZE, context, StepType.PROCESS)
+        saveValues(result)
+        diagnostics.markEnd(KeyType.INITIALIZE, context, true, StepType.PROCESS)
+        return null
     }
 
-    /**
-     * Check the value of a Feature Gate configured in the Statsig console for the initialized user,
-     * but do not log an exposure
-     * @param gateName the name of the feature gate to check
-     * @return the value of the gate for the initialized user, or false if not found
-     * @throws IllegalStateException if the SDK has not been initialized
-     */
-    fun checkGateWithExposureLoggingDisabled(gateName: String): Boolean {
-        val functionName = "checkGateWithExposureLoggingDisabled"
-        enforceInitialized(functionName)
-        var result: FeatureGate? = null
-        errorBoundary.capture(
-            {
-                this.logger.addNonExposedCheck(gateName)
-                val gate = getFeatureGateEvaluation(gateName)
-                result = gate
-            },
-            tag = functionName,
-            configName = gateName
+    private fun saveValues(result: StatsigNetwork.InitializeResult) {
+        val saved = db.one(
+            "save_values",
+            mapOf("payload" to result.payload, "user" to result.user, "scoped_key" to result.scopedKey)
         )
-        val res = result ?: FeatureGate.getError(gateName)
-        options.evaluationCallback?.invoke(res)
-        return res.getValue()
+        if (saved?.bool("has_updates") == true && saved.bool("applied")) {
+            statsigScope.launch(dispatcherProvider.main) { lifetimeCallback?.onValuesUpdated() }
+        }
     }
 
-    fun getFeatureGate(gateName: String): FeatureGate {
-        val functionName = "getFeatureGate"
-        enforceInitialized(functionName)
-        var result: FeatureGate? = null
-
-        errorBoundary.capture(
-            {
-                val gate = getFeatureGateEvaluation(gateName)
-                logExposure(gateName, gate)
-                result = gate
-            },
-            tag = functionName,
-            configName = gateName
-        )
-
-        val res = result ?: FeatureGate.getError(gateName)
-        options.evaluationCallback?.invoke(res)
-        return res
-    }
-
-    fun getFeatureGateWithExposureLoggingDisabled(gateName: String): FeatureGate {
-        val functionName = "getFeatureGateWithExposureLoggingDisabled"
-        enforceInitialized(functionName)
-        var result: FeatureGate? = null
-        errorBoundary.capture(
-            {
-                this.logger.addNonExposedCheck(gateName)
-                val gate = getFeatureGateEvaluation(gateName)
-                result = gate
-            },
-            tag = functionName,
-            configName = gateName
-        )
-        val res = result ?: FeatureGate.getError(gateName)
-        options.evaluationCallback?.invoke(res)
-        return res
-    }
+    // ---------------------------------------------------------------------------------------
+    // Evaluation
 
     /**
-     * Check the value of a Dynamic Config configured in the Statsig console for the initialized
-     * user
-     * @param configName the name of the Dynamic Config to check
-     * @return the Dynamic Config the initialized user
+     * The value of a feature gate for the current user, logging an exposure.
      * @throws IllegalStateException if the SDK has not been initialized
-     * @see checkGate
      */
-    fun getConfig(configName: String): DynamicConfig {
-        val functionName = "getConfig"
-        enforceInitialized(functionName)
-        var result: DynamicConfig = DynamicConfig.getError(configName)
-        errorBoundary.capture(
-            {
-                val config = getDynamicConfigEvaluation(configName)
-                logExposure(configName, config)
-                result = config
-            },
-            tag = functionName,
-            configName = configName
-        )
-        options.evaluationCallback?.invoke(result)
-        return result
+    fun checkGate(gateName: String): Boolean = evaluateGate("checkGate", gateName, logExposure = true).getValue()
+
+    fun checkGateWithExposureLoggingDisabled(gateName: String): Boolean =
+        evaluateGate("checkGateWithExposureLoggingDisabled", gateName, logExposure = false).getValue()
+
+    fun getFeatureGate(gateName: String): FeatureGate = evaluateGate("getFeatureGate", gateName, logExposure = true)
+
+    fun getFeatureGateWithExposureLoggingDisabled(gateName: String): FeatureGate =
+        evaluateGate("getFeatureGateWithExposureLoggingDisabled", gateName, logExposure = false)
+
+    /** A dynamic config for the current user, logging an exposure. */
+    fun getConfig(configName: String): DynamicConfig = evaluateConfig("getConfig", configName, true) {
+        getDynamicConfigEvaluation(configName)
     }
 
-    /**
-     * Check the value of a Dynamic Config configured in the Statsig console for the initialized
-     * user, but do not log an exposure
-     * @param configName the name of the Dynamic Config to check
-     * @return the Dynamic Config the initialized user
-     * @throws IllegalStateException if the SDK has not been initialized
-     */
-    fun getConfigWithExposureLoggingDisabled(configName: String): DynamicConfig {
-        val functionName = "getConfigWithExposureLoggingDisabled"
-        enforceInitialized(functionName)
-        var result: DynamicConfig = DynamicConfig.getError(configName)
-        errorBoundary.capture(
-            {
-                this.logger.addNonExposedCheck(configName)
-                result = getDynamicConfigEvaluation(configName)
-            },
-            tag = functionName,
-            configName = configName
-        )
-        options.evaluationCallback?.invoke(result)
-        return result
-    }
+    fun getConfigWithExposureLoggingDisabled(configName: String): DynamicConfig =
+        evaluateConfig("getConfigWithExposureLoggingDisabled", configName, false) {
+            getDynamicConfigEvaluation(configName)
+        }
 
     /**
-     * Check the value of an Experiment configured in the Statsig console for the initialized user
-     * @param experimentName the name of the Experiment to check
-     * @param keepDeviceValue whether the value returned should be kept for the user on the device
-     * for the duration of the experiment
-     * @return the Dynamic Config backing the experiment
-     * @throws IllegalStateException if the SDK has not been initialized
-     * @see checkGate
+     * An experiment for the current user, logging an exposure. With [keepDeviceValue] the value
+     * is kept on the device for as long as the experiment runs.
      */
-    fun getExperiment(experimentName: String, keepDeviceValue: Boolean = false): DynamicConfig {
-        val functionName = "getExperiment"
-        enforceInitialized(functionName)
-        var res: DynamicConfig = DynamicConfig.getError(experimentName)
-        errorBoundary.capture(
-            {
-                res = getExperimentEvaluation(experimentName, keepDeviceValue)
-                if (keepDeviceValue) {
-                    updateStickyValues()
-                }
-                logExposure(experimentName, res)
-            },
-            tag = functionName,
-            configName = experimentName
-        )
-        options.evaluationCallback?.invoke(res)
-        return res
-    }
+    fun getExperiment(experimentName: String, keepDeviceValue: Boolean = false): DynamicConfig =
+        evaluateConfig("getExperiment", experimentName, true) {
+            getExperimentEvaluation(experimentName, keepDeviceValue)
+        }
 
-    /**
-     * Check the value of an Experiment configured in the Statsig console for the initialized user,
-     * but do not log an exposure
-     * @param experimentName the name of the Experiment to check
-     * @param keepDeviceValue whether the value returned should be kept for the user on the device
-     * for the duration of the experiment
-     * @return the Dynamic Config backing the experiment
-     * @throws IllegalStateException if the SDK has not been initialized
-     */
     fun getExperimentWithExposureLoggingDisabled(
         experimentName: String,
         keepDeviceValue: Boolean = false
-    ): DynamicConfig {
-        val functionName = "getExperimentWithExposureLoggingDisabled"
-        enforceInitialized(functionName)
-        var exp: DynamicConfig = DynamicConfig.getError(experimentName)
-        errorBoundary.capture(
-            {
-                this.logger.addNonExposedCheck(experimentName)
-                exp = getExperimentEvaluation(experimentName, keepDeviceValue)
-                if (keepDeviceValue) {
-                    updateStickyValues()
-                }
-            },
-            configName = experimentName,
-            tag = functionName
-        )
-        options.evaluationCallback?.invoke(exp)
-        return exp
+    ): DynamicConfig = evaluateConfig("getExperimentWithExposureLoggingDisabled", experimentName, false) {
+        getExperimentEvaluation(experimentName, keepDeviceValue)
     }
 
-    /**
-     * Check the value of an Layer configured in the Statsig console for the initialized user
-     * @param layerName the name of the Layer to check
-     * @param keepDeviceValue whether the value returned should be kept for the user on the device
-     * for the duration of any active experiments
-     * @return the current layer values as a Layer object
-     * @throws IllegalStateException if the SDK has not been initialized
-     * @see checkGate
-     */
-    fun getLayer(layerName: String, keepDeviceValue: Boolean = false): Layer {
-        val functionName = "getLayer"
-        enforceInitialized(functionName)
-        var layer: Layer = Layer.getError(layerName)
-        errorBoundary.capture(
-            {
-                layer = getLayerEvaluation(this, layerName, keepDeviceValue)
-                if (keepDeviceValue) {
-                    updateStickyValues()
-                }
-            },
-            tag = functionName,
-            configName = layerName
-        )
-        options.evaluationCallback?.invoke(layer)
-        return layer
-    }
+    /** A layer for the current user. Exposures are logged as its parameters are read. */
+    fun getLayer(layerName: String, keepDeviceValue: Boolean = false): Layer =
+        evaluateLayer("getLayer", layerName, keepDeviceValue, logExposure = true)
 
-    /**
-     * Check the value of a Layer configured in the Statsig console for the initialized user, but
-     * never log exposures from this Layer
-     * @param layerName the name of the Layer to check
-     * @param keepDeviceValue whether the value returned should be kept for the user on the device
-     * for the duration of any active experiments
-     * @return the current layer values as a Layer object
-     * @throws IllegalStateException if the SDK has not been initialized
-     */
-    fun getLayerWithExposureLoggingDisabled(
-        layerName: String,
-        keepDeviceValue: Boolean = false
-    ): Layer {
-        val functionName = "getLayerWithExposureLoggingDisabled"
-        enforceInitialized(functionName)
-        var layer: Layer = Layer.getError(layerName)
-        errorBoundary.capture(
-            {
-                this.logger.addNonExposedCheck(layerName)
-                layer = getLayerEvaluation(null, layerName, keepDeviceValue)
-                if (keepDeviceValue) {
-                    updateStickyValues()
-                }
-            },
-            tag = functionName,
-            configName = layerName
-        )
-        options.evaluationCallback?.invoke(layer)
-        return layer
-    }
+    fun getLayerWithExposureLoggingDisabled(layerName: String, keepDeviceValue: Boolean = false): Layer =
+        evaluateLayer("getLayerWithExposureLoggingDisabled", layerName, keepDeviceValue, logExposure = false)
 
-    /**
-     * Get a Parameter Store configured in the Statsig console for the initialized user
-     * @see checkGate
-     */
+    /** A parameter store for the current user. */
     fun getParameterStore(
         parameterStoreName: String,
         options: ParameterStoreEvaluationOptions? = null
     ): ParameterStore {
-        val functionName = "getParameterStore"
-        enforceInitialized(functionName)
-        var paramStore = ParameterStore(
-            this,
-            HashMap(),
-            parameterStoreName,
-            store.getEvalDetails(false),
-            options
-        )
+        enforceInitialized("getParameterStore")
+        var paramStore = ParameterStore(this, HashMap(), parameterStoreName, globalEvalDetails(EvalReason.Unrecognized), options)
         errorBoundary.capture(
             {
-                this.logger.addNonExposedCheck(parameterStoreName)
-                paramStore = store.getParamStore(this, parameterStoreName, options)
+                db.run("count_non_exposed", mapOf("name" to parameterStoreName))
+                val row = db.one("get_param_store", mapOf("name" to parameterStoreName))!!
+                paramStore = ParameterStore(this, jsonParamStore(row.string("value")), parameterStoreName, row.evalDetails(), options)
                 paramStore = onDeviceEvalAdapter?.getParamStore(this, paramStore) ?: paramStore
             },
-            tag = functionName,
+            tag = "getParameterStore",
             configName = parameterStoreName
         )
         return paramStore
     }
 
+    private fun evaluateGate(functionName: String, gateName: String, logExposure: Boolean): FeatureGate {
+        enforceInitialized(functionName)
+        var result: FeatureGate? = null
+        errorBoundary.capture(
+            {
+                if (!logExposure) db.run("count_non_exposed", mapOf("name" to gateName))
+                val gate = getFeatureGateEvaluation(gateName)
+                if (logExposure) logGateExposure(gate, isManual = false)
+                result = gate
+            },
+            tag = functionName,
+            configName = gateName
+        )
+        val gate = result ?: FeatureGate.getError(gateName)
+        options.evaluationCallback?.invoke(gate)
+        return gate
+    }
+
+    private fun evaluateConfig(
+        functionName: String,
+        name: String,
+        logExposure: Boolean,
+        evaluate: () -> DynamicConfig
+    ): DynamicConfig {
+        enforceInitialized(functionName)
+        var result = DynamicConfig.getError(name)
+        errorBoundary.capture(
+            {
+                if (!logExposure) db.run("count_non_exposed", mapOf("name" to name))
+                result = evaluate()
+                if (logExposure) logConfigExposure(result, isManual = false)
+            },
+            tag = functionName,
+            configName = name
+        )
+        options.evaluationCallback?.invoke(result)
+        return result
+    }
+
+    private fun evaluateLayer(functionName: String, layerName: String, keepDeviceValue: Boolean, logExposure: Boolean): Layer {
+        enforceInitialized(functionName)
+        var layer = Layer.getError(layerName)
+        errorBoundary.capture(
+            {
+                if (!logExposure) db.run("count_non_exposed", mapOf("name" to layerName))
+                layer = getLayerEvaluation(if (logExposure) this else null, layerName, keepDeviceValue)
+            },
+            tag = functionName,
+            configName = layerName
+        )
+        options.evaluationCallback?.invoke(layer)
+        return layer
+    }
+
+    private fun getFeatureGateEvaluation(gateName: String): FeatureGate {
+        val gate = db.one("get_gate", mapOf("name" to gateName))!!.toFeatureGate()
+        return onDeviceEvalAdapter?.getGate(gate, user) ?: gate
+    }
+
+    private fun getDynamicConfigEvaluation(configName: String): DynamicConfig {
+        val config = db.one("get_config", mapOf("name" to configName))!!.toDynamicConfig()
+        return onDeviceEvalAdapter?.getDynamicConfig(config, user) ?: config
+    }
+
+    private fun getExperimentEvaluation(experimentName: String, keepDeviceValue: Boolean): DynamicConfig {
+        val experiment = db.one(
+            "get_experiment",
+            mapOf("name" to experimentName, "kind" to "config", "keep" to keepDeviceValue)
+        )!!.toDynamicConfig()
+        return onDeviceEvalAdapter?.getDynamicConfig(experiment, user) ?: experiment
+    }
+
+    private fun getLayerEvaluation(client: StatsigClient?, layerName: String, keepDeviceValue: Boolean): Layer {
+        val layer = db.one(
+            "get_experiment",
+            mapOf("name" to layerName, "kind" to "layer", "keep" to keepDeviceValue)
+        )!!.toLayer(client)
+        return onDeviceEvalAdapter?.getLayer(client, layer, user) ?: layer
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Logging
+
     /**
      * Log an event to Statsig for the current user
-     * @param eventName the name of the event to track
-     * @param value an optional value associated with the event, for aggregations/analysis
-     * @param metadata an optional map of metadata associated with the event
      * @throws IllegalStateException if the SDK has not been initialized
      */
     @JvmOverloads
     fun logEvent(eventName: String, value: Double? = null, metadata: Map<String, String>? = null) {
-        logEvent(eventName, value, widenStringMetadata(metadata))
+        logEvent(eventName, value, metadata as Map<String, Any>?)
     }
 
-    /**
-     * Log an event to Statsig for the current user
-     * @param eventName the name of the event to track
-     * @param value an optional value associated with the event, for aggregations/analysis
-     * @param metadata an optional map of metadata associated with the event
-     * @throws IllegalStateException if the SDK has not been initialized
-     */
     @JvmName("logEventWithAnyMetadata")
     fun logEvent(eventName: String, value: Double?, metadata: Map<String, Any>?) {
-        val functionName = "logEvent"
-        enforceInitialized(functionName)
-        errorBoundary.capture(
-            {
-                val event = LogEvent(eventName)
-                event.value = value
-                event.metadata = metadata
-                event.user = user
-
-                val eventStatsigMetadata = mutableMapOf<String, String>()
-                if (!options.disableCurrentActivityLogging) {
-                    lifecycleListener.getCurrentActivity()?.let {
-                        eventStatsigMetadata.put("currentPage", it.javaClass.simpleName)
-                    }
-                }
-                if (options.logNetworkMetadata) {
-                    eventStatsigMetadata.putAll(connectivityListener.getLogEventNetworkMetadata())
-                }
-                if (eventStatsigMetadata.isNotEmpty()) {
-                    event.statsigMetadata = eventStatsigMetadata.toMap()
-                }
-                statsigScope.launch { logger.log(event) }
-            },
-            tag = functionName
-        )
+        val eventMetadata = mutableMapOf<String, String>()
+        if (this::options.isInitialized) {
+            if (!options.disableCurrentActivityLogging) {
+                lifecycleListener.getCurrentActivity()?.let { eventMetadata["currentPage"] = it.javaClass.simpleName }
+            }
+            if (options.logNetworkMetadata) {
+                eventMetadata.putAll(connectivityListener.getLogEventNetworkMetadata())
+            }
+        }
+        logCustomEvent(eventName, value, metadata, eventMetadata.ifEmpty { null })
     }
 
-    /**
-     * Log an event to Statsig for the current user
-     * @param eventName the name of the event to track
-     * @param value an optional value associated with the event
-     * @param metadata an optional map of metadata associated with the event
-     * @throws IllegalStateException if the SDK has not been initialized
-     */
     @JvmOverloads
     fun logEvent(eventName: String, value: String, metadata: Map<String, String>? = null) {
-        logEvent(eventName, value, widenStringMetadata(metadata))
+        logEvent(eventName, value, metadata as Map<String, Any>?)
     }
 
-    /**
-     * Log an event to Statsig for the current user
-     * @param eventName the name of the event to track
-     * @param value an optional value associated with the event
-     * @param metadata an optional map of metadata associated with the event
-     * @throws IllegalStateException if the SDK has not been initialized
-     */
     @JvmName("logEventWithAnyMetadata")
     fun logEvent(eventName: String, value: String, metadata: Map<String, Any>?) {
-        val functionName = "logEvent"
-        enforceInitialized(functionName)
-        errorBoundary.capture(
-            {
-                val event = LogEvent(eventName)
-                event.value = value
-                event.metadata = metadata
-                event.user = user
-                statsigScope.launch { logger.log(event) }
-            },
-            tag = functionName
-        )
+        logCustomEvent(eventName, value, metadata, null)
     }
 
-    /**
-     * Log an event to Statsig for the current user
-     * @param eventName the name of the event to track
-     * @param metadata an optional map of metadata associated with the event
-     * @throws IllegalStateException if the SDK has not been initialized
-     */
     fun logEvent(eventName: String, metadata: Map<String, String>) {
-        logEvent(eventName, widenStringMetadata(metadata)!!)
+        logEvent(eventName, metadata as Map<String, Any>)
     }
 
-    /**
-     * Log an event to Statsig for the current user
-     * @param eventName the name of the event to track
-     * @param metadata an optional map of metadata associated with the event
-     * @throws IllegalStateException if the SDK has not been initialized
-     */
     @JvmName("logEventWithAnyMetadata")
     fun logEvent(eventName: String, metadata: Map<String, Any>) {
-        val functionName = "logEvent"
-        enforceInitialized(functionName)
+        logCustomEvent(eventName, null, metadata, null)
+    }
+
+    private fun logCustomEvent(eventName: String, value: Any?, metadata: Map<String, Any>?, statsigMetadata: Map<String, String>?) {
+        enforceInitialized("logEvent")
         errorBoundary.capture(
             {
-                val event = LogEvent(eventName)
-                event.value = null
-                event.metadata = metadata
-                event.user = user
-                statsigScope.launch { logger.log(event) }
+                queued(
+                    db.one(
+                        "log_event",
+                        mapOf(
+                            "event_name" to eventName,
+                            "value" to toJson(value),
+                            "metadata" to toJson(metadata),
+                            "statsig_metadata" to toJson(statsigMetadata)
+                        )
+                    )
+                )
             },
-            tag = functionName
+            tag = "logEvent"
         )
     }
 
-    private fun widenStringMetadata(metadata: Map<String, String>?): Map<String, Any>? = metadata
+    private fun logGateExposure(gate: FeatureGate, isManual: Boolean) {
+        val details = gate.getEvalDetails()
+        queued(
+            db.one(
+                "log_gate_exposure",
+                mapOf(
+                    "name" to gate.getName(), "value" to gate.getValue(), "rule_id" to gate.getRuleID(),
+                    "secondary" to toJson(gate.getSecondaryExposures()),
+                    "reason" to details.getDetailedReasonString(), "lcut" to details.lcut,
+                    "received_at" to details.receivedAt, "manual" to isManual
+                )
+            )
+        )
+    }
 
-    /**
-     * Update the Statsig SDK with the given runtime-mutable options
-     *
-     * @param runtimeMutableOptions: the desired new options values
-     */
-    fun updateRuntimeOptions(runtimeMutableOptions: StatsigRuntimeMutableOptions) {
-        val functionName = "updateRuntimeOptions"
+    private fun logConfigExposure(config: DynamicConfig, isManual: Boolean) {
+        val details = config.getEvalDetails()
+        queued(
+            db.one(
+                "log_config_exposure",
+                mapOf(
+                    "name" to config.getName(), "rule_id" to config.getRuleID(),
+                    "secondary" to toJson(config.getSecondaryExposures()),
+                    "reason" to details.getDetailedReasonString(), "lcut" to details.lcut,
+                    "received_at" to details.receivedAt, "rule_passed" to config.getRulePassed(),
+                    "manual" to isManual
+                )
+            )
+        )
+    }
+
+    internal fun logLayerParameterExposure(layer: Layer, parameterName: String, isManual: Boolean = false) {
+        if (!isInitialized()) return
+        val details = layer.getEvalDetails()
+        queued(
+            db.one(
+                "log_layer_exposure",
+                mapOf(
+                    "name" to layer.getName(), "rule_id" to layer.getRuleIDForParameter(parameterName),
+                    "parameter" to parameterName,
+                    "explicit" to toJson(layer.getExplicitParameters()),
+                    "allocated" to layer.getAllocatedExperimentName(),
+                    "secondary" to toJson(layer.getSecondaryExposures()),
+                    "undelegated" to toJson(layer.getUndelegatedSecondaryExposures()),
+                    "reason" to details.getDetailedReasonString(),
+                    "received_at" to details.receivedAt, "manual" to isManual
+                )
+            )
+        )
+    }
+
+    fun manuallyLogGateExposure(gateName: String) = manualExposure("logManualGateExposure", gateName) {
+        logGateExposure(db.one("get_gate", mapOf("name" to gateName))!!.toFeatureGate(), isManual = true)
+    }
+
+    fun manuallyLogConfigExposure(configName: String) = manualExposure("logManualConfigExposure", configName) {
+        logConfigExposure(db.one("get_config", mapOf("name" to configName))!!.toDynamicConfig(), isManual = true)
+    }
+
+    fun manuallyLogExperimentExposure(configName: String, keepDeviceValue: Boolean) =
+        manualExposure("logManualExperimentExposure", configName) {
+            val experiment = db.one(
+                "get_experiment",
+                mapOf("name" to configName, "kind" to "config", "keep" to keepDeviceValue)
+            )!!.toDynamicConfig()
+            logConfigExposure(experiment, isManual = true)
+        }
+
+    fun manuallyLogLayerParameterExposure(layerName: String, parameterName: String, keepDeviceValue: Boolean) =
+        manualExposure("logManualLayerExposure", layerName) {
+            val layer = db.one(
+                "get_experiment",
+                mapOf("name" to layerName, "kind" to "layer", "keep" to keepDeviceValue)
+            )!!.toLayer(null)
+            logLayerParameterExposure(layer, parameterName, isManual = true)
+        }
+
+    fun manuallyLogGateExposure(gate: FeatureGate) =
+        manualExposure("logManualGateExposure", gate.getName()) { logGateExposure(gate, isManual = true) }
+
+    fun manuallyLogConfigExposure(config: DynamicConfig) =
+        manualExposure("logManualConfigExposure", config.getName()) { logConfigExposure(config, isManual = true) }
+
+    fun manuallyLogExperimentExposure(experiment: DynamicConfig) =
+        manualExposure("logManualExperimentExposure", experiment.getName()) {
+            logConfigExposure(experiment, isManual = true)
+        }
+
+    fun manuallyLogLayerParameterExposure(layer: Layer, parameterName: String) =
+        manualExposure("logManualLayerExposure", layer.getName()) {
+            logLayerParameterExposure(layer, parameterName, isManual = true)
+        }
+
+    private fun manualExposure(functionName: String, name: String, log: () -> Unit) {
         enforceInitialized(functionName)
+        errorBoundary.capture(log, tag = functionName, configName = name)
+    }
+
+    /** Flushes when the SQL says the queue is full. */
+    private fun queued(row: Row?) {
+        if (row?.bool("should_flush") == true) statsigScope.launch(dispatcherProvider.io) { flushEvents() }
+    }
+
+    private suspend fun flushEvents() {
+        flushLock.withLock {
+            val batch = db.one(
+                "take_batch",
+                mapOf("metadata" to toJson(statsigClientMetadata), "logging_enabled" to loggingEnabled)
+            )
+            if (batch == null) {
+                if (!loggingEnabled) Log.d(TAG, "loggingEnabled is FALSE, flush() skipped")
+                return
+            }
+            val count = batch.long("n").toString()
+            network.postLogs(eventLoggingAPI, batch.string("body")!!, count, statsigClientMetadata)
+            Log.v(TAG, "flush() completed with $count events")
+        }
+    }
+
+    private fun logDiagnostics(context: ContextType) {
+        if (diagnostics.logDiagnostics(context)) statsigScope.launch(dispatcherProvider.io) { flushEvents() }
+    }
+
+    suspend fun flush() {
+        enforceInitialized("flush")
+        errorBoundary.captureAsync(task = {
+            Log.v(TAG, "starting manual flush...")
+            flushEvents()
+        }, tag = "flush")
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Users and values
+
+    fun updateRuntimeOptions(runtimeMutableOptions: StatsigRuntimeMutableOptions) {
+        enforceInitialized("updateRuntimeOptions")
         errorBoundary.capture(
             {
-                this.runtimeMutableOptions =
-                    StatsigRuntimeMutableOptions(
-                        loggingEnabled = runtimeMutableOptions.loggingEnabled,
-                        eventLoggingAPI = runtimeMutableOptions.eventLoggingAPI
-                    )
-                this.logger.setLoggingEnabled(runtimeMutableOptions.loggingEnabled)
-                this.logger.setApi(runtimeMutableOptions.eventLoggingAPI)
+                loggingEnabled = runtimeMutableOptions.loggingEnabled
+                eventLoggingAPI = runtimeMutableOptions.eventLoggingAPI
                 Log.v(TAG, "Runtime options successfully updated")
             },
-            tag = functionName
+            tag = "updateRuntimeOptions"
         )
     }
 
     /**
-     * Update the Statsig SDK with Feature Gate and Dynamic Configs for a new user, or the same user
-     * with additional properties. Will make network call in a separate coroutine. But fetch cached
-     * values from memory synchronously.
-     *
-     * @param user the updated user
-     * @param callback a callback to invoke upon update completion. Before this callback is invoked,
-     * checking Gates will return false, getting Configs will return null, and Log Events will be
-     * dropped
-     * @throws IllegalStateException if the SDK has not been initialized
+     * Switch to a new user (or the same user with new properties). Cached values for the user are
+     * used right away; fresh values are fetched in the background unless [values] are given.
      */
-    fun updateUserAsync(
-        user: StatsigUser?,
-        callback: IStatsigCallback? = null,
-        values: Map<String, Any>? = null
-    ) {
-        val functionName = "updateUserAsync"
-        enforceInitialized(functionName)
+    fun updateUserAsync(user: StatsigUser?, callback: IStatsigCallback? = null, values: Map<String, Any>? = null) {
+        enforceInitialized("updateUserAsync")
         errorBoundary.capture(
             {
-                diagnostics.markStart(
-                    KeyType.OVERALL,
-                    overrideContext = ContextType.UPDATE_USER
-                )
-                this.user = normalizeUser(user)
-                this.resetUser()
+                diagnostics.markStart(KeyType.OVERALL, ContextType.UPDATE_USER)
+                switchUser(user)
                 if (values != null) {
-                    this.store.bootstrap(values, this.user)
+                    bootstrap(values)
                     logEndDiagnostics(true, ContextType.UPDATE_USER, null)
                     Log.v(TAG, "updateUserAsync completed with provided values")
                     callback?.onStatsigUpdateUser()
                     lifetimeCallback?.onValuesUpdated()
                 } else {
-                    this.store.loadCacheForCurrentUser()
+                    db.run("load_cache")
                     statsigScope.launch {
                         updateUserImpl()
                         withContext(dispatcherProvider.main) {
@@ -748,53 +690,32 @@ class StatsigClient : LifecycleEventListener {
                     }
                 }
             },
-            tag = functionName
+            tag = "updateUserAsync"
         )
     }
 
-    /**
-     * Update the Statsig SDK with Feature Gate and Dynamic Configs for a new user, or the same user
-     * with additional properties
-     *
-     * @param user the updated user
-     * @throws IllegalStateException if the SDK has not been initialized
-     */
     suspend fun updateUser(user: StatsigUser?, values: Map<String, Any>? = null) {
-        val functionName = "updateUser"
-        enforceInitialized(functionName)
+        enforceInitialized("updateUser")
         errorBoundary.captureAsync(task = {
-            diagnostics.markStart(KeyType.OVERALL, overrideContext = ContextType.UPDATE_USER)
-            this.user = normalizeUser(user)
-            this.resetUser()
+            diagnostics.markStart(KeyType.OVERALL, ContextType.UPDATE_USER)
+            switchUser(user)
             if (values != null) {
-                this.store.bootstrap(values, this.user)
+                bootstrap(values)
                 logEndDiagnostics(true, ContextType.UPDATE_USER, null)
                 Log.v(TAG, "updateUser completed with provided values")
             } else {
-                this.store.loadCacheForCurrentUser()
+                db.run("load_cache")
                 updateUserImpl()
                 Log.v(TAG, "updateUser completed")
             }
-        }, tag = functionName)
+        }, tag = "updateUser")
     }
 
-    /**
-     * Update the Statsig SDK with Feature Gate and Dynamic Configs for the current user
-     *
-     * @param callback a callback to invoke upon update completion. Before this callback is invoked,
-     * checking Gates will return false, getting Configs will return null, and Log Events will be
-     * dropped
-     * @throws IllegalStateException if the SDK has not been initialized
-     */
     suspend fun refreshCacheAsync(callback: IStatsigCallback? = null) {
-        val functionName = "refreshCacheAsync"
-        enforceInitialized(functionName)
+        enforceInitialized("refreshCacheAsync")
         errorBoundary.capture(
             {
-                diagnostics.markStart(
-                    KeyType.OVERALL,
-                    overrideContext = ContextType.UPDATE_USER
-                )
+                diagnostics.markStart(KeyType.OVERALL, ContextType.UPDATE_USER)
                 statsigScope.launch {
                     updateUserImpl()
                     withContext(dispatcherProvider.main) {
@@ -807,44 +728,181 @@ class StatsigClient : LifecycleEventListener {
                     }
                 }
             },
-            tag = functionName
+            tag = "refreshCacheAsync"
         )
     }
 
-    /**
-     * Update the Statsig SDK with Feature Gate and Dynamic Configs for the current user
-     *
-     * @throws IllegalStateException if the SDK has not been initialized
-     */
     suspend fun refreshCache() {
-        val functionName = "refreshCache"
-        enforceInitialized(functionName)
+        enforceInitialized("refreshCache")
         errorBoundary.captureAsync(task = {
-            diagnostics.markStart(KeyType.OVERALL, overrideContext = ContextType.UPDATE_USER)
+            diagnostics.markStart(KeyType.OVERALL, ContextType.UPDATE_USER)
             updateUserImpl()
             Log.v(TAG, "refreshCache completed")
-        }, tag = functionName)
+        }, tag = "refreshCache")
     }
 
-    /**
-     * @return Initialize response currently being used in JSON and evaluation details
-     * @throws IllegalStateException if the SDK has not been initialized
-     */
+    private fun switchUser(newUser: StatsigUser?) {
+        user = normalizeUser(newUser)
+        pollingJob?.cancel()
+        db.run("set_user", mapOf("user" to userJson(), "scoped_key" to scopedCacheKey()))
+    }
+
+    private suspend fun updateUserImpl() = withContext(dispatcherProvider.io) {
+        errorBoundary.captureAsync(
+            tag = "updateUserImpl",
+            task = {
+                val failure = fetchValues(ContextType.UPDATE_USER)
+                pollForUpdates()
+                logEndDiagnostics(failure == null, ContextType.UPDATE_USER, failure)
+            },
+            recover = { logEndDiagnosticsWhenException(ContextType.UPDATE_USER, it) }
+        )
+    }
+
+    private fun bootstrap(values: Map<String, Any>) {
+        db.run("bootstrap", mapOf("values" to gson.toJson(values)))
+    }
+
+    private fun pollForUpdates() {
+        if (!options.enableAutoValueUpdate) return
+        pollingJob?.cancel()
+        val interval = maxOf((options.autoValueUpdateIntervalMinutes * 60 * 1000).toLong(), MIN_POLLING_INTERVAL_MS)
+        pollingJob = statsigScope.launch(dispatcherProvider.io) {
+            while (isActive) {
+                delay(interval)
+                try {
+                    val result = network.initialize(null, statsigClientMetadata, HashAlgorithm.DJB2, poll = true)
+                    if (result.payload != null) saveValues(result)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Init Polling Error", e)
+                }
+            }
+        }
+    }
+
+    /** @return the values in use, as JSON, with their evaluation details */
     fun getInitializeResponseJson(): ExternalInitializeResponse {
-        val functionName = "getInitializeResponseJson"
+        enforceInitialized("getInitializeResponseJson")
         var result: ExternalInitializeResponse? = null
-        enforceInitialized(functionName)
         errorBoundary.capture(
-            { result = store.getCurrentCacheValuesAndEvalDetails() },
-            tag = functionName
+            {
+                val row = db.one("values_json")!!
+                result = ExternalInitializeResponse(
+                    row.string("json"),
+                    EvalDetails(
+                        EvalSource.valueOf(row.string("source")!!),
+                        EvalReason.Recognized,
+                        row.long("lcut"),
+                        row.long("received_at")
+                    )
+                )
+            },
+            tag = "getInitializeResponseJson"
         )
         return result ?: ExternalInitializeResponse.getUninitialized()
     }
 
+    // ---------------------------------------------------------------------------------------
+    // Overrides
+
+    /** @param value the result to be returned when checkGate is called */
+    fun overrideGate(gateName: String, value: Boolean) = setOverride("overrideGate", "gate", gateName, value)
+
+    /** @param value the values to be returned when getConfig or getExperiment is called */
+    fun overrideConfig(configName: String, value: Map<String, Any>) =
+        setOverride("overrideConfig", "config", configName, value)
+
+    /** @param value the values to be returned in a Layer object when getLayer is called */
+    fun overrideLayer(configName: String, value: Map<String, Any>) =
+        setOverride("overrideLayer", "layer", configName, value)
+
+    private fun setOverride(functionName: String, kind: String, name: String, value: Any) {
+        errorBoundary.capture(
+            {
+                db.run("override_set", mapOf("kind" to kind, "name" to name, "value" to gson.toJson(value)))
+                Log.v(TAG, "$functionName() completed")
+            },
+            tag = functionName
+        )
+    }
+
+    /** Clears any override of a gate, config, experiment or layer with this name. */
+    fun removeOverride(name: String) {
+        errorBoundary.capture({ db.run("override_remove", mapOf("name" to name)) }, tag = "removeOverride")
+    }
+
+    /** Throw away all overridden values */
+    fun removeAllOverrides() {
+        errorBoundary.capture({ db.run("override_clear") }, tag = "removeAllOverrides")
+    }
+
+    /** @return the overrides that are currently applied */
+    fun getAllOverrides(): StatsigOverrides {
+        var result: StatsigOverrides? = null
+        errorBoundary.capture(
+            {
+                val overrides = StatsigOverrides.empty()
+                for (row in db.run("overrides")) {
+                    val name = row.string("name")!!
+                    val value = row.string("value")!!
+                    when (row.string("kind")) {
+                        "gate" -> overrides.gates[name] = value == "true"
+                        "config" -> overrides.configs[name] = jsonMap(value)
+                        "layer" -> overrides.layers[name] = jsonMap(value)
+                    }
+                }
+                result = overrides
+            },
+            tag = "getAllOverrides"
+        )
+        return result ?: StatsigOverrides.empty()
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Metadata, lifecycle
+
+    /** @return the current Statsig stableID */
+    @Deprecated(
+        "This function will be deprecated in a future release - the field is available in StatsigMetadata",
+        ReplaceWith("getStatsigMetadata().stableID")
+    )
+    fun getStableID(): String {
+        enforceInitialized("getStableID")
+        return statsigClientMetadata.stableID ?: ""
+    }
+
+    /** @return the current Statsig sessionID */
+    @Deprecated(
+        "This function will be deprecated in a future release - the field is available in StatsigMetadata",
+        ReplaceWith("getStatsigMetadata().stableID")
+    )
+    fun getSessionID(): String {
+        enforceInitialized("getSessionID")
+        return statsigClientMetadata.sessionID
+    }
+
+    /** @return the current [StatsigMetadata] of this client instance */
+    fun getStatsigMetadata(): StatsigMetadata {
+        enforceInitialized("getStatsigMetadata()")
+        return statsigClientMetadata.copy()
+    }
+
+    fun openDebugView(context: Context, callback: DebugViewCallback? = null) {
+        errorBoundary.capture({
+            val row = db.one("values_json")!!
+            val map = mapOf(
+                "values" to row.string("json"),
+                "evalReason" to globalEvalDetails().getDetailedReasonString(),
+                "user" to user.getCopyForEvaluation(),
+                "options" to options.toMap()
+            )
+            DebugView.show(context, sdkKey, map, callback)
+        }, tag = "openDebugView")
+    }
+
     suspend fun shutdownSuspend() {
-        val functionName = "shutdownSuspend"
-        enforceInitialized(functionName)
-        errorBoundary.captureAsync(task = { shutdownImpl() }, tag = functionName)
+        enforceInitialized("shutdownSuspend")
+        errorBoundary.captureAsync(task = { shutdownImpl() }, tag = "shutdownSuspend")
     }
 
     /**
@@ -856,759 +914,15 @@ class StatsigClient : LifecycleEventListener {
         runBlocking { withContext(Dispatchers.Main.immediate) { shutdownSuspend() } }
     }
 
-    suspend fun flush() {
-        val functionName = "flush"
-        enforceInitialized(functionName)
-        errorBoundary.captureAsync(task = {
-            Log.v(TAG, "starting manual flush...")
-            this.logger.flush()
-        }, tag = functionName)
-    }
-
-    /**
-     * @param gateName the name of the gate you want to override
-     * @param value the result to be returned when checkGate is called
-     */
-    fun overrideGate(gateName: String, value: Boolean) {
-        errorBoundary.capture(
-            {
-                this.store.overrideGate(gateName, value)
-                statsigScope.launch { this@StatsigClient.store.saveOverridesToLocalStorage() }
-                Log.v(TAG, "overrideGate() completed")
-            },
-            tag = "overrideGate"
-        )
-    }
-
-    /**
-     * @param configName the name of the config or experiment you want to override
-     * @param value the resulting values to be returned when getConfig or getExperiment is called
-     */
-    fun overrideConfig(configName: String, value: Map<String, Any>) {
-        errorBoundary.capture(
-            {
-                this.store.overrideConfig(configName, value)
-                statsigScope.launch { this@StatsigClient.store.saveOverridesToLocalStorage() }
-                Log.v(TAG, "overrideConfig() completed")
-            },
-            tag = "overrideConfig"
-        )
-    }
-
-    /**
-     * @param layerName the name of the layer you want to override
-     * @param value the resulting values to be returned in a Layer object when getLayer is called
-     */
-    fun overrideLayer(configName: String, value: Map<String, Any>) {
-        errorBoundary.capture(
-            {
-                this.store.overrideLayer(configName, value)
-                statsigScope.launch { this@StatsigClient.store.saveOverridesToLocalStorage() }
-                Log.v(TAG, "overrideLayer() completed")
-            },
-            tag = "overrideLayer"
-        )
-    }
-
-    /**
-     * @param name the name of the overridden gate, config or experiment you want to clear an
-     * override from
-     */
-    fun removeOverride(name: String) {
-        val functionName = "removeOverride"
-        errorBoundary.capture({
-            this.store.removeOverride(name)
-            statsigScope.launch { this@StatsigClient.store.saveOverridesToLocalStorage() }
-            Log.v(TAG, "removeOverride() completed")
-        }, tag = functionName)
-    }
-
-    /** Throw away all overridden values */
-    fun removeAllOverrides() {
-        val functionName = "removeAllOverrides"
-        errorBoundary.capture({
-            this.store.removeAllOverrides()
-            statsigScope.launch { this@StatsigClient.store.saveOverridesToLocalStorage() }
-            Log.v(TAG, "removeAllOverrides() completed")
-        }, tag = functionName)
-    }
-
-    /** @return the current Statsig stableID, or an empty [String] prior to completion of async initialization */
-    @Deprecated(
-        "This function will be deprecated in a future release - the field is available in StatsigMetadata",
-        ReplaceWith("getStatsigMetadata().stableID")
-    )
-    fun getStableID(): String {
-        val functionName = "getStableID"
-        enforceInitialized(functionName)
-        var result = ""
-        errorBoundary.capture({
-            result = statsigClientMetadata.stableID ?: ""
-        }, tag = "getStableID")
-        return result
-    }
-
-    /**
-     * @return the current Statsig sessionID
-     */
-    @Deprecated(
-        "This function will be deprecated in a future release - the field is available in StatsigMetadata",
-        ReplaceWith("getStatsigMetadata().stableID")
-    )
-    fun getSessionID(): String {
-        val functionName = "getSessionID"
-        enforceInitialized(functionName)
-        var result = ""
-        errorBoundary.capture({ result = statsigClientMetadata.sessionID }, tag = "getSessionID")
-        return result
-    }
-
-    /**
-     * @return the current [StatsigMetadata] of this client instance
-     */
-    fun getStatsigMetadata(): StatsigMetadata {
-        val functionName = "getStatsigMetadata()"
-        enforceInitialized(functionName)
-        return statsigClientMetadata.copy()
-    }
-
-    /**
-     * Log an exposure for a given config
-     * @param configName the name of the config to log an exposure for
-     * @throws IllegalStateException if the SDK has not been initialized
-     */
-    fun manuallyLogGateExposure(gateName: String) {
-        val functionName = "logManualGateExposure"
-        enforceInitialized(functionName)
-        errorBoundary.capture(
-            {
-                val gate = store.checkGate(gateName)
-                logExposure(gateName, gate, isManual = true)
-            },
-            tag = functionName,
-            configName = gateName
-        )
-    }
-
-    fun manuallyLogConfigExposure(configName: String) {
-        val functionName = "logManualConfigExposure"
-        enforceInitialized(functionName)
-        errorBoundary.capture(
-            {
-                val config = store.getConfig(configName)
-                logExposure(configName, config, isManual = true)
-            },
-            tag = functionName,
-            configName = configName
-        )
-    }
-
-    /**
-     * Log an exposure for a given experiment
-     * @param experimentName the name of the experiment to log an exposure for
-     * @throws IllegalStateException if the SDK has not been initialized
-     */
-    fun manuallyLogExperimentExposure(configName: String, keepDeviceValue: Boolean) {
-        val functionName = "logManualExperimentExposure"
-        enforceInitialized(functionName)
-        errorBoundary.capture(
-            {
-                val exp = store.getExperiment(configName, keepDeviceValue)
-                logExposure(configName, exp, isManual = true)
-            },
-            tag = functionName,
-            configName = configName
-        )
-    }
-
-    /**
-     * Log an exposure for a given parameter in a given layer
-     * @param layerName the relevant layer
-     * @param parameterName the specific parameter
-     * @throws IllegalStateException if the SDK has not been initialized
-     */
-    fun manuallyLogLayerParameterExposure(
-        layerName: String,
-        parameterName: String,
-        keepDeviceValue: Boolean
-    ) {
-        val functionName = "logManualLayerExposure"
-        enforceInitialized(functionName)
-        errorBoundary.capture(
-            {
-                val layer = store.getLayer(null, layerName, keepDeviceValue)
-                logLayerParameterExposure(layer, parameterName, isManual = true)
-            },
-            configName = layerName,
-            tag = functionName
-        )
-    }
-
-    fun manuallyLogGateExposure(gate: FeatureGate) {
-        val functionName = "logManualGateExposure"
-        enforceInitialized(functionName)
-        errorBoundary.capture(
-            {
-                logExposure(gate.getName(), gate, isManual = true)
-            },
-            tag = functionName,
-            configName = gate.getName()
-        )
-    }
-
-    fun manuallyLogConfigExposure(config: DynamicConfig) {
-        val functionName = "logManualConfigExposure"
-        enforceInitialized(functionName)
-        errorBoundary.capture(
-            {
-                logExposure(config.getName(), config, isManual = true)
-            },
-            tag = functionName,
-            configName = config.getName()
-        )
-    }
-
-    fun manuallyLogExperimentExposure(experiment: DynamicConfig) {
-        val functionName = "logManualExperimentExposure"
-        enforceInitialized(functionName)
-        errorBoundary.capture(
-            {
-                logExposure(experiment.getName(), experiment, isManual = true)
-            },
-            tag = functionName,
-            configName = experiment.getName()
-        )
-    }
-
-    fun manuallyLogLayerParameterExposure(layer: Layer, parameterName: String) {
-        val functionName = "logManualLayerExposure"
-        enforceInitialized(functionName)
-        errorBoundary.capture(
-            {
-                logLayerParameterExposure(layer, parameterName, isManual = true)
-            },
-            configName = layer.getName(),
-            tag = functionName
-        )
-    }
-
-    /** @return the overrides that are currently applied */
-    fun getAllOverrides(): StatsigOverrides {
-        val functionName = "getAllOverrides"
-        var result: StatsigOverrides? = null
-        errorBoundary.capture({ result = getStore().getAllOverrides() }, tag = functionName)
-        return result ?: StatsigOverrides.empty()
-    }
-
-    fun openDebugView(context: Context, callback: DebugViewCallback? = null) {
-        val functionName = "openDebugView"
-        errorBoundary.capture({
-            val currentValues = store.getCurrentValuesAsString()
-            val map =
-                mapOf(
-                    "values" to currentValues,
-                    "evalReason" to store.getGlobalEvalDetails().getDetailedReasonString(),
-                    "user" to user.getCopyForEvaluation(),
-                    "options" to options.toMap()
-                )
-            DebugView.show(context, sdkKey, map, callback)
-        }, tag = functionName)
-    }
-
-    @VisibleForTesting
-    internal suspend fun setupAsync(user: StatsigUser): InitializationDetails {
-        val functionName = "setupAsync"
-        return withContext(dispatcherProvider.io) {
-            return@withContext errorBoundary.captureAsync(
-                tag = functionName,
-                task = {
-                    if (this@StatsigClient.isBootstrapped.get()) {
-                        val evalDetails = store.getGlobalEvalDetails()
-                        this@StatsigClient.diagnostics.markEnd(
-                            KeyType.OVERALL,
-                            evalDetails.source == EvalSource.Bootstrap,
-                            additionalMarker = Marker(
-                                evaluationDetails = evalDetails.toLoggingEvaluationDetails()
-                            )
-                        )
-                        logger.logDiagnostics()
-                        return@captureAsync InitializationDetails(
-                            duration = 0,
-                            success = true,
-                            failureDetails = null,
-                            source = getInitializationDetailsSource()
-                        )
-                    }
-                    if (this@StatsigClient.options.loadCacheAsync) {
-                        diagnostics.markStart(
-                            KeyType.INITIALIZE,
-                            StepType.LOAD_CACHE,
-                            Marker(isBlocking = false)
-                        )
-                        this@StatsigClient.store.loadFromLocalStorage()
-                        diagnostics.markEnd(KeyType.INITIALIZE, true, StepType.LOAD_CACHE)
-                    }
-                    val initResponse =
-                        if (this@StatsigClient.options.initializeOffline) {
-                            store.notifyOfflineInit()
-                            store.getCachedInitializationResponse()
-                        } else {
-                            statsigNetwork.initialize(
-                                this@StatsigClient.options.api,
-                                user,
-                                this@StatsigClient.store.getLastUpdateTime(
-                                    this@StatsigClient.user
-                                ),
-                                this@StatsigClient.statsigClientMetadata,
-                                statsigScope,
-                                ContextType.INITIALIZE,
-                                this@StatsigClient.diagnostics,
-                                if (this@StatsigClient.options.disableHashing == true) {
-                                    HashAlgorithm.NONE
-                                } else {
-                                    HashAlgorithm.DJB2
-                                },
-                                this@StatsigClient.store.getPreviousDerivedFields(
-                                    this@StatsigClient.user
-                                ),
-                                this@StatsigClient.store.getFullChecksum(
-                                    this@StatsigClient.user
-                                )
-                            )
-                        }
-                    if (initResponse is InitializeResponse.SuccessfulInitializeResponse &&
-                        !options.initializeOffline
-                    ) {
-                        this@StatsigClient.diagnostics.markStart(
-                            KeyType.INITIALIZE,
-                            StepType.PROCESS
-                        )
-                        this@StatsigClient.store.saveAsync(initResponse, user) {
-                            integratedSdkExperiments.processSdkConfigs(
-                                store.getSDKConfigs() ?: emptyMap(),
-                                this@StatsigClient
-                            )
-                        }
-                        if (initResponse.hasUpdates) {
-                            statsigScope.launch(dispatcherProvider.main) {
-                                lifetimeCallback?.onValuesUpdated()
-                            }
-                        }
-                        this@StatsigClient.diagnostics.markEnd(
-                            KeyType.INITIALIZE,
-                            true,
-                            StepType.PROCESS
-                        )
-                    }
-
-                    this@StatsigClient.pollForUpdates()
-
-                    if (this@StatsigClient.options.disableLogEventRetries != true) {
-                        retryScope.launch(dispatcherProvider.io) {
-                            try {
-                                this@StatsigClient.statsigNetwork.apiRetryFailedLogs(
-                                    this@StatsigClient.runtimeMutableOptions.eventLoggingAPI,
-                                    this@StatsigClient.options.logEventFallbackUrls,
-                                    statsigClientMetadata
-                                )
-                            } catch (e: Exception) {
-                                // best effort attempt to capture failed log events
-                            }
-                        }
-                    }
-
-                    val success =
-                        initResponse is InitializeResponse.SuccessfulInitializeResponse
-                    if (!success && !options.initializeOffline) {
-                        store.notifyNetworkFailure()
-                    }
-                    logEndDiagnostics(success, ContextType.INITIALIZE, initResponse)
-                    InitializationDetails(
-                        duration = 0,
-                        success = success,
-                        failureDetails =
-                        initResponse as? InitializeResponse.FailedInitializeResponse,
-                        source = getInitializationDetailsSource()
-                    )
-                },
-                recover = { e: Exception ->
-                    logEndDiagnosticsWhenException(ContextType.INITIALIZE, e)
-                    InitializationDetails(
-                        duration = 0,
-                        success = false,
-                        failureDetails = InitializeResponse.FailedInitializeResponse(
-                            if (e is TimeoutCancellationException) {
-                                InitializeFailReason.CoroutineTimeout
-                            } else {
-                                InitializeFailReason.InternalError
-                            },
-                            e
-                        ),
-                        source = getInitializationDetailsSource()
-                    )
-                }
-            )
-        }
-    }
-
-    @VisibleForTesting
-    private fun setup(
-        application: Application,
-        sdkKey: String,
-        user: StatsigUser? = null,
-        options: StatsigOptions = StatsigOptions()
-    ): StatsigUser {
-        if (!sdkKey.startsWith("client-") && !sdkKey.startsWith("test-")) {
-            throw IllegalArgumentException(
-                "Invalid SDK Key provided.  You must provide a client SDK Key from the API Key page of your Statsig console"
-            )
-        }
-        initTime = SystemClock.elapsedRealtime()
-        HttpUtils.maybeInitializeHttpClient(application)
-        HttpUtils.addInterceptors(options.interceptors ?: emptyList())
-        this.diagnostics = Diagnostics(options.getLoggingCopy())
-        diagnostics.markStart(KeyType.OVERALL)
-        this.application = application
-
-        val storageScope = CoroutineScope(SupervisorJob() + dispatcherProvider.io)
-
-        // Rely on legacy for migration hint, which should eventually be the only bit left there.
-        val bootstrapStorage = LegacyKeyValueStorage(application)
-        integratedSdkExperiments.initialize(bootstrapStorage)
-
-        // Prevent replacing existing test overrides
-        if (keyValueStorageImplementationOverride == KeyValueStorageImplementation.LEGACY) {
-            keyValueStorageImplementationOverride =
-                integratedSdkExperiments.getStorageImplementation()
-        }
-        val storage = createKeyValueStorage(application, storageScope)
-
-        this.keyValueStorage = storage
-        this.sdkKey = sdkKey
-        this.options = options
-        this.runtimeMutableOptions =
-            StatsigRuntimeMutableOptions(
-                loggingEnabled = options.loggingEnabled,
-                eventLoggingAPI = options.eventLoggingAPI
-            )
-        val normalizedUser = normalizeUser(user)
-        val initializeValues = options.initializeValues
-        this.user = normalizedUser
-        this.lifetimeCallback = options.lifetimeCallback
-        exceptionHandler = errorBoundary.getExceptionHandler()
-        statsigScope = CoroutineScope(statsigJob + dispatcherProvider.main + exceptionHandler)
-        val networkFallbackResolver =
-            NetworkFallbackResolver(
-                keyValueStorage,
-                statsigScope,
-                gson
-            )
-        store = Store(statsigScope, keyValueStorage, normalizedUser, sdkKey, options, gson)
-
-        this.connectivityListener = StatsigNetworkConnectivityListener(application)
-        // Prevent overwriting mocked network in tests
-        if (!this::statsigNetwork.isInitialized) {
-            statsigNetwork =
-                StatsigNetwork(
-                    connectivityListener,
-                    sdkKey,
-                    keyValueStorage,
-                    options,
-                    networkFallbackResolver,
-                    statsigScope,
-                    store,
-                    gson
-                )
-        }
-        statsigClientMetadata =
-            if (options.optOutNonSdkMetadata) {
-                createCoreStatsigMetadata()
-            } else {
-                createStatsigMetadata()
-            }
-        errorBoundary.setMetadata(statsigClientMetadata)
-
-        onDeviceEvalAdapter = options.onDeviceEvalAdapter
-        this.initialized.set(true)
-
-        lifecycleListener = StatsigActivityLifecycleListener(application, this)
-
-        logger =
-            StatsigLogger(
-                statsigScope,
-                sdkKey,
-                runtimeMutableOptions.eventLoggingAPI,
-                statsigClientMetadata,
-                statsigNetwork,
-                normalizedUser,
-                { store.getBootstrapMetadata() },
-                diagnostics,
-                options.logEventFallbackUrls,
-                runtimeMutableOptions.loggingEnabled,
-                gson
-            )
-        populateStatsigMetadata()
-
-        if (options.overrideStableID == null) {
-            val stableID = getLocalStorageStableID()
-            this@StatsigClient.statsigClientMetadata.overrideStableID(stableID)
-        }
-
-        if (!this@StatsigClient.options.loadCacheAsync) {
-            diagnostics.markStart(
-                KeyType.INITIALIZE,
-                StepType.LOAD_CACHE,
-                Marker(isBlocking = true)
-            )
-            this@StatsigClient.store.syncLoadFromLocalStorage()
-            diagnostics.markEnd(KeyType.INITIALIZE, true, StepType.LOAD_CACHE)
-        }
-
-        if (initializeValues != null) {
-            this@StatsigClient.store.bootstrap(initializeValues, this@StatsigClient.user)
-            this@StatsigClient.isBootstrapped.set(true)
-        }
-        return normalizedUser
-    }
-
-    private fun resetUser() {
-        val functionName = "resetUser"
-        errorBoundary.capture({
-            logger.onUpdateUser()
-            pollingJob?.cancel()
-            this.store.resetUser(this.user)
-        }, tag = functionName)
-    }
-
-    private suspend fun updateUserImpl() {
-        val functionName = "updateUserImpl"
-        withContext(dispatcherProvider.io) {
-            errorBoundary.captureAsync(
-                tag = functionName,
-                task = {
-                    store.awaitPendingSave()
-                    val sinceTime = store.getLastUpdateTime(this@StatsigClient.user)
-                    val previousDerivedFields =
-                        store.getPreviousDerivedFields(this@StatsigClient.user)
-                    val fullChecksum = store.getFullChecksum(this@StatsigClient.user)
-                    val initResponse =
-                        statsigNetwork.initialize(
-                            options.api,
-                            this@StatsigClient.user,
-                            sinceTime,
-                            statsigClientMetadata,
-                            statsigScope,
-                            ContextType.UPDATE_USER,
-                            diagnostics = this@StatsigClient.diagnostics,
-                            hashUsed = if (this@StatsigClient.options.disableHashing ==
-                                true
-                            ) {
-                                HashAlgorithm.NONE
-                            } else {
-                                HashAlgorithm.DJB2
-                            },
-                            previousDerivedFields = previousDerivedFields,
-                            fullChecksum = fullChecksum
-                        )
-                    if (initResponse is InitializeResponse.SuccessfulInitializeResponse) {
-                        diagnostics.markStart(
-                            KeyType.INITIALIZE,
-                            StepType.PROCESS,
-                            overrideContext = ContextType.UPDATE_USER
-                        )
-                        store.save(initResponse, this@StatsigClient.user)
-                        integratedSdkExperiments.processSdkConfigs(
-                            store.getSDKConfigs() ?: emptyMap(),
-                            this@StatsigClient
-                        )
-                        if (initResponse.hasUpdates) {
-                            statsigScope.launch(dispatcherProvider.main) {
-                                lifetimeCallback?.onValuesUpdated()
-                            }
-                        }
-                        diagnostics.markEnd(
-                            KeyType.INITIALIZE,
-                            true,
-                            StepType.PROCESS,
-                            overrideContext = ContextType.UPDATE_USER
-                        )
-                    } else {
-                        store.notifyNetworkFailure()
-                    }
-                    pollForUpdates()
-                    logEndDiagnostics(
-                        initResponse is InitializeResponse.SuccessfulInitializeResponse,
-                        ContextType.UPDATE_USER,
-                        initResponse
-                    )
-                },
-                recover = { logEndDiagnosticsWhenException(ContextType.UPDATE_USER, it) }
-            )
-        }
-    }
-
-    private fun getFeatureGateEvaluation(gateName: String): FeatureGate {
-        val gate = store.checkGate(gateName)
-        return onDeviceEvalAdapter?.getGate(gate, user) ?: gate
-    }
-
-    private fun getDynamicConfigEvaluation(configName: String): DynamicConfig {
-        val config = store.getConfig(configName)
-        return onDeviceEvalAdapter?.getDynamicConfig(config, user) ?: config
-    }
-
-    private fun getExperimentEvaluation(
-        experimentName: String,
-        keepDeviceValue: Boolean
-    ): DynamicConfig {
-        val experiment = store.getExperiment(experimentName, keepDeviceValue)
-        return onDeviceEvalAdapter?.getDynamicConfig(experiment, user) ?: experiment
-    }
-
-    private fun getLayerEvaluation(
-        client: StatsigClient?,
-        layerName: String,
-        keepDeviceValue: Boolean
-    ): Layer {
-        val layer = store.getLayer(client, layerName, keepDeviceValue)
-        return onDeviceEvalAdapter?.getLayer(client, layer, user) ?: layer
-    }
-
-    internal fun logLayerParameterExposure(
-        layer: Layer,
-        parameterName: String,
-        isManual: Boolean = false
-    ) {
-        if (!isInitialized()) {
-            return
-        }
-
-        var exposures = layer.getUndelegatedSecondaryExposures()
-        var allocatedExperiment = ""
-        val isExplicit = layer.getExplicitParameters()?.contains(parameterName) == true
-        if (isExplicit) {
-            exposures = layer.getSecondaryExposures()
-            allocatedExperiment = layer.getAllocatedExperimentName() ?: ""
-        }
-
-        logger.logLayerExposure(
-            layer.getName(),
-            layer.getRuleIDForParameter(parameterName),
-            exposures,
-            user,
-            allocatedExperiment,
-            parameterName,
-            isExplicit,
-            layer.getEvalDetails(),
-            isManual
-        )
-    }
-
-    internal fun getStore(): Store = store
-
-    private fun logExposure(name: String, config: DynamicConfig, isManual: Boolean = false) {
-        logger.logExposure(name, config, user, isManual)
-    }
-
-    private fun logExposure(name: String, gate: FeatureGate, isManual: Boolean = false) {
-        logger.logExposure(name, gate, user, isManual)
-    }
-
-    private fun updateStickyValues() {
-        statsigScope.launch(dispatcherProvider.io) { store.persistStickyValues() }
-    }
-
-    private fun getLocalStorageStableID(): String {
-        var stableID = this@StatsigClient.keyValueStorage.readValueSync(
-            STABLE_ID_STORE_NAME,
-            STABLE_ID_KEY
-        )
-        if (stableID == null) {
-            stableID = UUID.randomUUID().toString()
-            statsigScope.launch {
-                withContext(dispatcherProvider.io) {
-                    keyValueStorage.writeValue(STABLE_ID_STORE_NAME, STABLE_ID_KEY, stableID)
-                }
-            }
-        }
-        return stableID
-    }
-
-    fun isInitialized(): Boolean = this.initialized.get()
-
-    internal fun enforceInitialized(functionName: String) {
-        if (!this.initialized.get()) {
-            throw IllegalStateException(
-                "The SDK must be initialized prior to invoking $functionName"
-            )
-        }
-    }
-
-    private fun normalizeUser(user: StatsigUser?): StatsigUser {
-        var normalizedUser = StatsigUser(null)
-        if (user != null) {
-            normalizedUser = user.getCopyForEvaluation()
-        }
-        normalizedUser.statsigEnvironment = options.getEnvironment()
-        options.userObjectValidator?.let { it(normalizedUser) }
-        return normalizedUser
-    }
-
-    private fun pollForUpdates() {
-        if (!this@StatsigClient.options.enableAutoValueUpdate) {
-            return
-        }
-        pollingJob?.cancel()
-        pollingJob =
-            statsigNetwork
-                .pollForChanges(
-                    options.api,
-                    user,
-                    statsigClientMetadata,
-                    (options.autoValueUpdateIntervalMinutes * 60 * 1000).toLong(),
-                    options.initializeFallbackUrls
-                )
-                .onEach {
-                    if (it != null) {
-                        store.awaitPendingSave()
-                        store.save(it, user)
-                        integratedSdkExperiments.processSdkConfigs(
-                            store.getSDKConfigs() ?: emptyMap(),
-                            this
-                        )
-                        if (it.hasUpdates) {
-                            Log.i(TAG, "enableAutoValueUpdate: values changed")
-                            withContext(dispatcherProvider.main) {
-                                lifetimeCallback?.onValuesUpdated()
-                            }
-                        }
-                    }
-                }
-                .launchIn(statsigScope)
-    }
-
-    private fun populateStatsigMetadata() {
-        statsigClientMetadata.overrideStableID(options.overrideStableID)
-        try {
-            if (application.packageManager != null && !options.optOutNonSdkMetadata) {
-                val pInfo: PackageInfo =
-                    application.packageManager.getPackageInfo(application.packageName, 0)
-                statsigClientMetadata.appVersion = pInfo.versionName
-                statsigClientMetadata.appIdentifier = pInfo.packageName
-            }
-        } catch (e: PackageManager.NameNotFoundException) {
-            // noop
-        }
-    }
-
     private suspend fun shutdownImpl() {
         Log.v(TAG, "shutting down...")
-        store.awaitPendingSave()
-        store.awaitCacheMaintenance()
         initialized.set(false)
         pollingJob?.cancel()
-        logger.shutdown()
+        flushTimer?.cancel()
+        flushEvents()
         lifecycleListener.shutdown()
+        statsigJob.cancel()
+        synchronized(db) { db.close() }
         isBootstrapped.set(false)
         errorBoundary = ErrorBoundary(errorScope)
         statsigJob = SupervisorJob()
@@ -1616,70 +930,97 @@ class StatsigClient : LifecycleEventListener {
         Log.v(TAG, "shutdown completed.")
     }
 
-    private fun logEndDiagnostics(
-        success: Boolean,
-        context: ContextType,
-        initResponse: InitializeResponse?
-    ) {
-        this@StatsigClient.diagnostics.markEnd(
-            KeyType.OVERALL,
-            success,
-            additionalMarker =
-            Marker(
-                evaluationDetails = store.getGlobalEvalDetails().toLoggingEvaluationDetails(),
-                error =
-                if (initResponse is InitializeResponse.FailedInitializeResponse) {
-                    Diagnostics.formatFailedResponse(
-                        initResponse
-                    )
-                } else {
-                    null
-                }
-            ),
-            overrideContext = context
-        )
-        logger.logDiagnostics(context)
-    }
+    fun isInitialized(): Boolean = initialized.get()
 
-    private fun logEndDiagnosticsWhenException(context: ContextType, e: Exception?) {
-        try {
-            if (this::diagnostics.isInitialized && this::logger.isInitialized) {
-                this@StatsigClient.diagnostics.markEnd(
-                    KeyType.OVERALL,
-                    false,
-                    additionalMarker =
-                    Marker(
-                        evaluationDetails =
-                        store.getGlobalEvalDetails().toLoggingEvaluationDetails(),
-                        error =
-                        Marker.ErrorMessage(
-                            message = "${e?.javaClass?.name}: ${e?.message}"
-                        )
-                    ),
-                    overrideContext = context
-                )
-                this@StatsigClient.logger.logDiagnostics(context)
-                statsigScope.launch(dispatcherProvider.io) { this@StatsigClient.logger.flush() }
-            }
-        } catch (e: Exception) {
-            // no-op
+    internal fun enforceInitialized(functionName: String) {
+        if (!initialized.get()) {
+            throw IllegalStateException("The SDK must be initialized prior to invoking $functionName")
         }
     }
 
     override fun onAppFocus() {
-        if (this.options.disableLogEventRetries) {
-            return
-        }
-        retryScope.launch(dispatcherProvider.io) {
-            statsigNetwork.apiRetryFailedLogs(
-                this@StatsigClient.runtimeMutableOptions.eventLoggingAPI,
-                this@StatsigClient.options.logEventFallbackUrls,
-                statsigClientMetadata
-            )
-        }
+        if (options.disableLogEventRetries) return
+        retryScope.launch { network.retryFailedLogs(eventLoggingAPI, statsigClientMetadata) }
     }
 
     override fun onAppBlur() {
-        statsigScope.launch { logger.flush() }
+        statsigScope.launch(dispatcherProvider.io) { flushEvents() }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Helpers
+
+    private fun normalizeUser(user: StatsigUser?): StatsigUser {
+        val normalized = user?.getCopyForEvaluation() ?: StatsigUser(null)
+        normalized.statsigEnvironment = options.getEnvironment()
+        options.userObjectValidator?.let { it(normalized) }
+        return normalized
+    }
+
+    private fun userJson(): String = gson.toJson(user)
+
+    private fun scopedCacheKey(): String = options.customCacheKey(sdkKey, user)
+
+    private fun globalEvalDetails(reason: EvalReason? = null): EvalDetails =
+        db.one("session_state")!!.evalDetails().apply { this.reason = reason }
+
+    private fun initializationSource(): EvalSource =
+        if (this::db.isInitialized) globalEvalDetails().source else EvalSource.Error
+
+    private fun failedInitialization(e: Exception?) = InitializationDetails(
+        duration = SystemClock.elapsedRealtime() - initTime,
+        success = false,
+        failureDetails = InitializeResponse.FailedInitializeResponse(InitializeFailReason.InternalError, e),
+        source = initializationSource()
+    )
+
+    private fun logInitResult(functionName: String, details: InitializationDetails) {
+        Log.v(TAG, "$functionName completed. Success: ${details.success}")
+        details.failureDetails?.let { failure ->
+            Log.e(TAG, "$functionName failure reason: ${failure.reason}")
+            failure.exception?.let { Log.e(TAG, "$functionName failure exception: $it") }
+        }
+    }
+
+    private fun populateStatsigMetadata() {
+        statsigClientMetadata.stableID = options.overrideStableID ?: db.one("stable_id")!!.string("stable_id")
+        try {
+            if (application.packageManager != null && !options.optOutNonSdkMetadata) {
+                val info = application.packageManager.getPackageInfo(application.packageName, 0)
+                statsigClientMetadata.appVersion = info.versionName
+                statsigClientMetadata.appIdentifier = info.packageName
+            }
+        } catch (e: PackageManager.NameNotFoundException) {
+            // noop
+        }
+    }
+
+    private fun logEndDiagnostics(
+        success: Boolean,
+        context: ContextType,
+        failure: InitializeResponse.FailedInitializeResponse?
+    ) {
+        diagnostics.markEnd(
+            KeyType.OVERALL, context, success,
+            evaluationDetails = globalEvalDetails(),
+            error = failure?.let { Diagnostics.formatFailedResponse(it) }
+        )
+        logDiagnostics(context)
+    }
+
+    private fun logEndDiagnosticsWhenException(context: ContextType, e: Exception?) {
+        try {
+            if (this::diagnostics.isInitialized) {
+                diagnostics.markEnd(
+                    KeyType.OVERALL, context, false,
+                    evaluationDetails = globalEvalDetails(),
+                    error = Marker.ErrorMessage(message = "${e?.javaClass?.name}: ${e?.message}")
+                )
+                logDiagnostics(context)
+                statsigScope.launch(dispatcherProvider.io) { flushEvents() }
+            }
+        } catch (_: Exception) {
+            // no-op
+        }
     }
 }

@@ -1,7 +1,5 @@
 package com.statsig.androidsdk
 
-import com.statsig.androidsdk.evaluator.ConfigEvaluation
-
 /**
  * A helper class for interfacing with Dynamic Configs defined in the Statsig console
  */
@@ -18,40 +16,6 @@ class DynamicConfig(
     private val allocatedExperimentName: String? = null,
     private val rulePassed: Boolean? = null
 ) : BaseConfig(name, details) {
-    internal constructor(
-        configName: String,
-        apiDynamicConfig: APIDynamicConfig,
-        evalDetails: EvalDetails
-    ) : this(
-        configName,
-        evalDetails,
-        apiDynamicConfig.value,
-        apiDynamicConfig.ruleID,
-        apiDynamicConfig.groupName,
-        apiDynamicConfig.secondaryExposures ?: arrayOf(),
-        apiDynamicConfig.isUserInExperiment,
-        apiDynamicConfig.isExperimentActive,
-        apiDynamicConfig.isDeviceBased,
-        apiDynamicConfig.allocatedExperimentName,
-        apiDynamicConfig.rulePassed
-    )
-
-    internal constructor(
-        configName: String,
-        evaluation: ConfigEvaluation,
-        details: EvalDetails
-    ) : this(
-        name = configName,
-        details = details,
-        jsonValue = evaluation.returnableValue?.mapValue ?: mapOf(),
-        rule = evaluation.ruleID,
-        groupName = evaluation.groupName,
-        secondaryExposures = evaluation.secondaryExposures.toTypedArray(),
-        isExperimentActive = evaluation.isActive,
-        isUserInExperiment = evaluation.isExperimentGroup,
-        isDeviceBased = false
-    )
-
     internal companion object {
         fun getError(name: String): DynamicConfig =
             DynamicConfig(name, EvalDetails(EvalSource.Error, EvalReason.Unrecognized))
