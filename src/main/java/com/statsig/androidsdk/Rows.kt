@@ -48,7 +48,7 @@ internal fun Row.toFeatureGate(): FeatureGate {
     val details = evalDetails()
     return when {
         bool("overridden") -> FeatureGate(name, details, string("value") == "true", "override")
-        string("value") == null -> FeatureGate(name, details, false)
+        !bool("found") -> FeatureGate(name, details, false)
         else -> FeatureGate(
             name,
             details,
@@ -66,7 +66,7 @@ internal fun Row.toDynamicConfig(): DynamicConfig {
     val details = evalDetails()
     return when {
         bool("overridden") -> DynamicConfig(name, details, jsonObject(string("value")), "override")
-        string("value") == null -> DynamicConfig(name, details)
+        !bool("found") -> DynamicConfig(name, details)
         else -> DynamicConfig(
             name,
             details,
@@ -88,7 +88,7 @@ internal fun Row.toLayer(client: StatsigClient?): Layer {
     val details = evalDetails()
     return when {
         bool("overridden") -> Layer(null, name, details, jsonObject(string("value")), "override")
-        string("value") == null -> Layer(client, name, details)
+        !bool("found") -> Layer(client, name, details)
         else -> Layer(
             client,
             name,

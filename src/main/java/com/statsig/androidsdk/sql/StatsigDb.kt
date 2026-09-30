@@ -1,8 +1,8 @@
 package com.statsig.androidsdk.sql
 
 /**
- * Runs the named SQL blocks for one client. A block runs in a single transaction; its result is
- * the rows of its last row-returning statement. Access is serialized: the SDK is called from many
+ * Runs the named SQL blocks for one client. A block is atomic (a transaction when it writes more
+ * than once); its result is the rows of its last row-returning statement. Access is serialized: the SDK is called from many
  * threads and a SQLite connection must not be.
  */
 internal class StatsigDb(private val driver: SqlDriver, private val script: SqlScript = SqlScript.default) {
@@ -14,7 +14,12 @@ internal class StatsigDb(private val driver: SqlDriver, private val script: SqlS
     fun run(block: String, params: Map<String, Any?> = emptyMap()): List<Row> {
         val statements = script.block(block)
         synchronized(this) {
-            if (statements.size == 1) return exec(statements[0], params) ?: emptyList()
+            // A block with at most one write is atomic by itself; only others need a transaction.
+            if (statements.count { !it.returnsRows } <= 1) {
+                var result: List<Row> = emptyList()
+                for (statement in statements) exec(statement, params)?.let { result = it }
+                return result
+            }
             driver.beginTransaction()
             try {
                 var result: List<Row> = emptyList()

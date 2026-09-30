@@ -40,6 +40,8 @@ dependencies {
 }
 
 tasks.test {
+    useJUnit()
+    maxHeapSize = "1g"
     testLogging { events("passed", "skipped", "failed"); exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL }
 }
 

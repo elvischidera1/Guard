@@ -9,6 +9,7 @@ import java.sql.Types
 internal class JdbcSqlDriver(path: String) : SqlDriver {
     private val connection: Connection = DriverManager.getConnection("jdbc:sqlite:$path")
     private val statements = HashMap<String, PreparedStatement>()
+    private val columns = HashMap<String, List<String>>()
 
     override fun execute(sql: String, args: List<Any?>) {
         prepare(sql, args).execute()
@@ -16,8 +17,7 @@ internal class JdbcSqlDriver(path: String) : SqlDriver {
 
     override fun query(sql: String, args: List<Any?>): List<Row> {
         prepare(sql, args).executeQuery().use { rs ->
-            val meta = rs.metaData
-            val names = (1..meta.columnCount).map { meta.getColumnLabel(it) }
+            val names = columns.getOrPut(sql) { rs.metaData.let { m -> (1..m.columnCount).map { m.getColumnLabel(it) } } }
             val rows = ArrayList<Row>()
             while (rs.next()) {
                 val row = HashMap<String, Any?>(names.size * 2)

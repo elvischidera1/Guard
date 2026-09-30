@@ -358,7 +358,7 @@ class StatsigClient : LifecycleEventListener {
         errorBoundary.capture(
             {
                 db.run("count_non_exposed", mapOf("name" to parameterStoreName))
-                val row = db.one("get_param_store", mapOf("name" to parameterStoreName))!!
+                val row = db.one("get_value", mapOf("kind" to "param_store", "name" to parameterStoreName))!!
                 paramStore = ParameterStore(this, jsonParamStore(row.string("value")), parameterStoreName, row.evalDetails(), options)
                 paramStore = onDeviceEvalAdapter?.getParamStore(this, paramStore) ?: paramStore
             },
@@ -423,12 +423,12 @@ class StatsigClient : LifecycleEventListener {
     }
 
     private fun getFeatureGateEvaluation(gateName: String): FeatureGate {
-        val gate = db.one("get_gate", mapOf("name" to gateName))!!.toFeatureGate()
+        val gate = db.one("get_value", mapOf("kind" to "gate", "name" to gateName))!!.toFeatureGate()
         return onDeviceEvalAdapter?.getGate(gate, user) ?: gate
     }
 
     private fun getDynamicConfigEvaluation(configName: String): DynamicConfig {
-        val config = db.one("get_config", mapOf("name" to configName))!!.toDynamicConfig()
+        val config = db.one("get_value", mapOf("kind" to "config", "name" to configName))!!.toDynamicConfig()
         return onDeviceEvalAdapter?.getDynamicConfig(config, user) ?: config
     }
 
@@ -565,11 +565,11 @@ class StatsigClient : LifecycleEventListener {
     }
 
     fun manuallyLogGateExposure(gateName: String) = manualExposure("logManualGateExposure", gateName) {
-        logGateExposure(db.one("get_gate", mapOf("name" to gateName))!!.toFeatureGate(), isManual = true)
+        logGateExposure(db.one("get_value", mapOf("kind" to "gate", "name" to gateName))!!.toFeatureGate(), isManual = true)
     }
 
     fun manuallyLogConfigExposure(configName: String) = manualExposure("logManualConfigExposure", configName) {
-        logConfigExposure(db.one("get_config", mapOf("name" to configName))!!.toDynamicConfig(), isManual = true)
+        logConfigExposure(db.one("get_value", mapOf("kind" to "config", "name" to configName))!!.toDynamicConfig(), isManual = true)
     }
 
     fun manuallyLogExperimentExposure(configName: String, keepDeviceValue: Boolean) =

@@ -19,6 +19,9 @@
 
 -- name: schema
 
+-- Per-client state is scratch data: keep TEMP tables in memory (the default is a temp file).
+PRAGMA temp_store = MEMORY;
+
 -- Durable ------------------------------------------------------------------------------------
 
 -- Small facts that outlive a session, e.g. the device's stable ID.
@@ -48,7 +51,7 @@ CREATE TABLE IF NOT EXISTS cache_key_map (
 CREATE TABLE IF NOT EXISTS sticky_value (
   owner TEXT NOT NULL,
   name_hash TEXT NOT NULL,
-  spec TEXT NOT NULL,                -- the experiment/layer JSON object as it was served
+  spec TEXT NOT NULL,                -- the experiment/layer as served, JSON (v1 shape)
   PRIMARY KEY (owner, name_hash)
 );
 
@@ -108,12 +111,33 @@ CREATE TEMP TABLE IF NOT EXISTS session (
   options TEXT                       -- StatsigOptions logging copy, JSON
 );
 
--- Gates, configs, layers and parameter stores of the values in use, keyed as served
--- (the server usually sends djb2-hashed names). spec is normalized to the v1 response shape.
+-- Gates, configs, layers and parameter stores of the values in use, keyed as served (the server
+-- usually sends djb2-hashed names). Fields are extracted once, when values are applied, so that
+-- lookups never parse JSON. Columns holding JSON say so.
 CREATE TEMP TABLE IF NOT EXISTS entity (
   kind TEXT NOT NULL,                -- 'gate' | 'config' | 'layer' | 'param_store'
   name TEXT NOT NULL,
-  spec TEXT NOT NULL,
+  value TEXT,                        -- JSON: true/false for gates, an object otherwise
+  rule_id TEXT,
+  group_name TEXT,
+  id_type TEXT,
+  secondary_exposures TEXT,          -- JSON array
+  undelegated_secondary_exposures TEXT, -- JSON array
+  is_user_in_experiment INTEGER NOT NULL DEFAULT 0,
+  is_experiment_active INTEGER NOT NULL DEFAULT 0,
+  is_device_based INTEGER NOT NULL DEFAULT 0,
+  allocated_experiment_name TEXT,
+  explicit_parameters TEXT,          -- JSON array
+  passed INTEGER,                    -- NULL when not served
+  parameter_rule_ids TEXT,           -- JSON object
+  PRIMARY KEY (kind, name)
+) WITHOUT ROWID;
+
+-- This client's copy of the overrides (kept in sync with local_override, which persists them).
+CREATE TEMP TABLE IF NOT EXISTS override (
+  kind TEXT NOT NULL,
+  name TEXT NOT NULL,
+  value TEXT NOT NULL,
   PRIMARY KEY (kind, name)
 ) WITHOUT ROWID;
 

@@ -35,80 +35,109 @@ BEGIN
 
   DELETE FROM entity;
 
-  -- v1: entities are stored as served.
-  INSERT OR REPLACE INTO entity (kind, name, spec)
-    SELECT 'gate', key, value FROM json_each(NEW.payload, '$.feature_gates')
-      WHERE type = 'object' AND json_extract(NEW.payload, '$.response_format') IS NOT 'init-v2'
-    UNION ALL
-    SELECT 'config', key, value FROM json_each(NEW.payload, '$.dynamic_configs')
-      WHERE type = 'object' AND json_extract(NEW.payload, '$.response_format') IS NOT 'init-v2'
-    UNION ALL
-    SELECT 'layer', key, value FROM json_each(NEW.payload, '$.layer_configs')
-      WHERE type = 'object' AND json_extract(NEW.payload, '$.response_format') IS NOT 'init-v2'
-    UNION ALL
-    SELECT 'param_store', key, value FROM json_each(NEW.payload, '$.param_stores')
-      WHERE type = 'object';
+  -- v1 (the usual response): fields are read from each entity object.
+  INSERT OR REPLACE INTO entity (kind, name, value, rule_id, group_name, id_type, secondary_exposures,
+      undelegated_secondary_exposures, is_user_in_experiment, is_experiment_active, is_device_based,
+      allocated_experiment_name, explicit_parameters, passed, parameter_rule_ids)
+    SELECT k.kind, e.key,
+      CASE WHEN k.kind = 'gate' THEN CASE WHEN json_extract(e.value, '$.value') THEN 'true' ELSE 'false' END
+        ELSE e.value -> '$.value' END,
+      json_extract(e.value, '$.rule_id'),
+      json_extract(e.value, '$.group_name'),
+      json_extract(e.value, '$.id_type'),
+      e.value -> '$.secondary_exposures',
+      e.value -> '$.undelegated_secondary_exposures',
+      coalesce(json_extract(e.value, '$.is_user_in_experiment'), 0),
+      coalesce(json_extract(e.value, '$.is_experiment_active'), 0),
+      coalesce(json_extract(e.value, '$.is_device_based'), 0),
+      json_extract(e.value, '$.allocated_experiment_name'),
+      e.value -> '$.explicit_parameters',
+      json_extract(e.value, '$.passed'),
+      e.value -> '$.parameter_rule_ids'
+    FROM (SELECT 'gate' AS kind, '$.feature_gates' AS path
+          UNION ALL SELECT 'config', '$.dynamic_configs'
+          UNION ALL SELECT 'layer', '$.layer_configs') AS k,
+      json_each(NEW.payload, k.path) AS e
+    WHERE e.type = 'object' AND json_extract(NEW.payload, '$.response_format') IS NOT 'init-v2';
 
-  -- init-v2: short keys, values and exposures shared through lookup tables. Expanded to v1.
-  INSERT OR REPLACE INTO entity (kind, name, spec)
-    SELECT 'gate', g.key, json_object(
-        'name', g.key,
-        'value', json(CASE WHEN json_extract(g.value, '$.v') THEN 'true' ELSE 'false' END),
-        'rule_id', coalesce(json_extract(g.value, '$.r'), 'default'),
-        'group_name', json_extract(g.value, '$.gn'),
-        'secondary_exposures', json((
-          SELECT json_group_array(json(x.value))
-          FROM json_each(g.value, '$.s') AS i
-            JOIN json_each(NEW.payload, '$.exposures') AS x ON x.key = i.value)),
-        'id_type', json_extract(g.value, '$.i'))
-    FROM json_each(NEW.payload, '$.feature_gates') AS g
-    WHERE json_extract(NEW.payload, '$.response_format') = 'init-v2';
+  INSERT OR REPLACE INTO entity (kind, name, value)
+    SELECT 'param_store', key, value FROM json_each(NEW.payload, '$.param_stores') WHERE type = 'object';
 
-  INSERT OR REPLACE INTO entity (kind, name, spec)
-    SELECT CASE c.path WHEN '$.dynamic_configs' THEN 'config' ELSE 'layer' END, c.key, json_object(
-        'name', c.key,
-        'value', json(coalesce(
-          (SELECT v.value FROM json_each(NEW.payload, '$.values') AS v
-           WHERE v.key = json_extract(c.value, '$.v')), '{}')),
-        'rule_id', coalesce(json_extract(c.value, '$.r'), 'default'),
-        'group_name', json_extract(c.value, '$.gn'),
-        'secondary_exposures', json((
-          SELECT json_group_array(json(x.value))
-          FROM json_each(c.value, '$.s') AS i
-            JOIN json_each(NEW.payload, '$.exposures') AS x ON x.key = i.value)),
-        'undelegated_secondary_exposures', json((
-          SELECT json_group_array(json(x.value))
-          FROM json_each(c.value, '$.us') AS i
-            JOIN json_each(NEW.payload, '$.exposures') AS x ON x.key = i.value)),
-        'is_device_based', json(CASE WHEN json_extract(c.value, '$.d') THEN 'true' ELSE 'false' END),
-        'is_user_in_experiment', json(CASE WHEN json_extract(c.value, '$.ue') THEN 'true' ELSE 'false' END),
-        'is_experiment_active', json(CASE WHEN json_extract(c.value, '$.ea') THEN 'true' ELSE 'false' END),
-        'allocated_experiment_name', json_extract(c.value, '$.ae'),
-        'explicit_parameters', json(coalesce(json_extract(c.value, '$.ep'), '[]')),
-        'passed', json(CASE json_type(c.value, '$.p') WHEN 'true' THEN 'true' WHEN 'false' THEN 'false' END),
-        'parameter_rule_ids', json(json_extract(c.value, '$.pr')))
-    FROM (
-      SELECT key, value, '$.dynamic_configs' AS path FROM json_each(NEW.payload, '$.dynamic_configs')
-      UNION ALL
-      SELECT key, value, '$.layer_configs' FROM json_each(NEW.payload, '$.layer_configs')
-    ) AS c
-    WHERE json_extract(NEW.payload, '$.response_format') = 'init-v2';
+  -- init-v2 (compact bootstrap format): short keys; values and exposures are shared through
+  -- lookup tables referenced by id.
+  INSERT OR REPLACE INTO entity (kind, name, value, rule_id, group_name, id_type, secondary_exposures,
+      undelegated_secondary_exposures, is_user_in_experiment, is_experiment_active, is_device_based,
+      allocated_experiment_name, explicit_parameters, passed, parameter_rule_ids)
+    SELECT k.kind, e.key,
+      CASE WHEN k.kind = 'gate' THEN CASE WHEN json_extract(e.value, '$.v') THEN 'true' ELSE 'false' END
+        ELSE coalesce((SELECT v.value FROM json_each(NEW.payload, '$.values') AS v
+                       WHERE v.key = json_extract(e.value, '$.v')), '{}') END,
+      coalesce(json_extract(e.value, '$.r'), 'default'),
+      json_extract(e.value, '$.gn'),
+      json_extract(e.value, '$.i'),
+      (SELECT json_group_array(json(x.value)) FROM json_each(e.value, '$.s') AS i
+         JOIN json_each(NEW.payload, '$.exposures') AS x ON x.key = i.value),
+      (SELECT json_group_array(json(x.value)) FROM json_each(e.value, '$.us') AS i
+         JOIN json_each(NEW.payload, '$.exposures') AS x ON x.key = i.value),
+      coalesce(json_extract(e.value, '$.ue'), 0),
+      coalesce(json_extract(e.value, '$.ea'), 0),
+      coalesce(json_extract(e.value, '$.d'), 0),
+      json_extract(e.value, '$.ae'),
+      coalesce(e.value -> '$.ep', '[]'),
+      json_extract(e.value, '$.p'),
+      e.value -> '$.pr'
+    FROM (SELECT 'gate' AS kind, '$.feature_gates' AS path
+          UNION ALL SELECT 'config', '$.dynamic_configs'
+          UNION ALL SELECT 'layer', '$.layer_configs') AS k,
+      json_each(NEW.payload, k.path) AS e
+    WHERE e.type = 'object' AND json_extract(NEW.payload, '$.response_format') = 'init-v2';
 
   DELETE FROM values_work;
 END;
 
--- The entity being looked up by the current get_* block, and the view that turns it into the
--- columns every model object is built from.
+-- An entity as JSON (the v1 response shape), for sticky values and getInitializeResponseJson.
+CREATE TEMP VIEW IF NOT EXISTS entity_json AS
+SELECT kind, name,
+  CASE WHEN kind = 'param_store' THEN value ELSE json_object(
+    'name', name,
+    'value', json(value),
+    'rule_id', rule_id,
+    'group_name', group_name,
+    'id_type', id_type,
+    'secondary_exposures', json(coalesce(secondary_exposures, '[]')),
+    'undelegated_secondary_exposures', json(coalesce(undelegated_secondary_exposures, '[]')),
+    'is_user_in_experiment', json(CASE WHEN is_user_in_experiment THEN 'true' ELSE 'false' END),
+    'is_experiment_active', json(CASE WHEN is_experiment_active THEN 'true' ELSE 'false' END),
+    'is_device_based', json(CASE WHEN is_device_based THEN 'true' ELSE 'false' END),
+    'allocated_experiment_name', allocated_experiment_name,
+    'explicit_parameters', json(explicit_parameters),
+    'passed', json(CASE passed WHEN 1 THEN 'true' WHEN 0 THEN 'false' END),
+    'parameter_rule_ids', json(parameter_rule_ids)) END AS json
+FROM entity;
+
+-- The entity looked up by the current get_* block, and the view every model object is built from.
 CREATE TEMP TABLE IF NOT EXISTS lookup (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   kind TEXT NOT NULL,
-  name TEXT NOT NULL,
-  name_hash TEXT,                    -- name as keyed by the server
+  name TEXT NOT NULL,                -- as asked for
+  entity_name TEXT,                  -- as served (NULL if not served)
+  name_hash TEXT,                    -- sticky values are keyed by the hashed name
   override TEXT,                     -- local override JSON, if any
-  spec TEXT,                         -- entity JSON (served or sticky)
   reason TEXT NOT NULL,              -- EvalReason name
-  latest TEXT,                       -- sticky bookkeeping (get_experiment / get_layer)
-  sticky TEXT,
+  value TEXT,
+  rule_id TEXT,
+  group_name TEXT,
+  id_type TEXT,
+  secondary_exposures TEXT,
+  undelegated_secondary_exposures TEXT,
+  is_user_in_experiment INTEGER,
+  is_experiment_active INTEGER,
+  is_device_based INTEGER,
+  allocated_experiment_name TEXT,
+  explicit_parameters TEXT,
+  passed INTEGER,
+  parameter_rule_ids TEXT,
+  sticky TEXT,                       -- kept value (JSON), get_experiment only
   latest_exp_active INTEGER
 );
 
@@ -117,27 +146,20 @@ SELECT
   l.kind,
   l.name,
   l.override IS NOT NULL AS overridden,
-  CASE
-    WHEN l.override IS NOT NULL THEN l.override
-    WHEN l.spec IS NULL THEN NULL
-    WHEN l.kind = 'gate' THEN CASE WHEN json_extract(l.spec, '$.value') THEN 'true' ELSE 'false' END
-    WHEN l.kind = 'param_store' THEN l.spec
-    ELSE json_extract(l.spec, '$.value')
-  END AS value,
-  CASE WHEN l.override IS NOT NULL THEN 'override'
-       WHEN l.spec IS NULL THEN ''
-       ELSE json_extract(l.spec, '$.rule_id') END AS rule_id,
-  CASE WHEN l.override IS NULL THEN json_extract(l.spec, '$.group_name') END AS group_name,
-  CASE WHEN l.override IS NULL THEN json_extract(l.spec, '$.id_type') END AS id_type,
-  CASE WHEN l.override IS NULL THEN json_extract(l.spec, '$.secondary_exposures') END AS secondary_exposures,
-  CASE WHEN l.override IS NULL THEN json_extract(l.spec, '$.undelegated_secondary_exposures') END AS undelegated_secondary_exposures,
-  CASE WHEN l.override IS NULL THEN coalesce(json_extract(l.spec, '$.is_user_in_experiment'), 0) ELSE 0 END AS is_user_in_experiment,
-  CASE WHEN l.override IS NULL THEN coalesce(json_extract(l.spec, '$.is_experiment_active'), 0) ELSE 0 END AS is_experiment_active,
-  CASE WHEN l.override IS NULL THEN coalesce(json_extract(l.spec, '$.is_device_based'), 0) ELSE 0 END AS is_device_based,
-  CASE WHEN l.override IS NULL THEN json_extract(l.spec, '$.allocated_experiment_name') END AS allocated_experiment_name,
-  CASE WHEN l.override IS NULL THEN json_extract(l.spec, '$.explicit_parameters') END AS explicit_parameters,
-  CASE WHEN l.override IS NULL THEN json_extract(l.spec, '$.passed') END AS rule_passed,
-  CASE WHEN l.override IS NULL THEN json_extract(l.spec, '$.parameter_rule_ids') END AS parameter_rule_ids,
+  l.override IS NULL AND l.entity_name IS NOT NULL AS found,
+  coalesce(l.override, l.value) AS value,
+  CASE WHEN l.override IS NOT NULL THEN 'override' WHEN l.entity_name IS NULL THEN '' ELSE l.rule_id END AS rule_id,
+  CASE WHEN l.override IS NULL THEN l.group_name END AS group_name,
+  CASE WHEN l.override IS NULL THEN l.id_type END AS id_type,
+  CASE WHEN l.override IS NULL THEN l.secondary_exposures END AS secondary_exposures,
+  CASE WHEN l.override IS NULL THEN l.undelegated_secondary_exposures END AS undelegated_secondary_exposures,
+  CASE WHEN l.override IS NULL THEN coalesce(l.is_user_in_experiment, 0) ELSE 0 END AS is_user_in_experiment,
+  CASE WHEN l.override IS NULL THEN coalesce(l.is_experiment_active, 0) ELSE 0 END AS is_experiment_active,
+  CASE WHEN l.override IS NULL THEN coalesce(l.is_device_based, 0) ELSE 0 END AS is_device_based,
+  CASE WHEN l.override IS NULL THEN l.allocated_experiment_name END AS allocated_experiment_name,
+  CASE WHEN l.override IS NULL THEN l.explicit_parameters END AS explicit_parameters,
+  CASE WHEN l.override IS NULL THEN l.passed END AS rule_passed,
+  CASE WHEN l.override IS NULL THEN l.parameter_rule_ids END AS parameter_rule_ids,
   s.source,
   l.reason,
   s.lcut,
@@ -160,6 +182,8 @@ DELETE FROM event_queue;
 DELETE FROM exposure_seen;
 DELETE FROM non_exposed;
 DELETE FROM marker;
+DELETE FROM override;
+INSERT INTO override (kind, name, value) SELECT kind, name, value FROM local_override;
 INSERT INTO hash_input (algo, input)
   SELECT 'djb2', :user
   WHERE NOT EXISTS (SELECT 1 FROM hash_memo WHERE algo = 'djb2' AND input = :user);
@@ -317,9 +341,9 @@ FROM session;
 -- name: values_json
 -- The values in use, as a v1 initialize response (getInitializeResponseJson, debug view).
 SELECT json_object(
-    'feature_gates', json((SELECT json_group_object(name, json(spec)) FROM entity WHERE kind = 'gate')),
-    'dynamic_configs', json((SELECT json_group_object(name, json(spec)) FROM entity WHERE kind = 'config')),
-    'layer_configs', json((SELECT json_group_object(name, json(spec)) FROM entity WHERE kind = 'layer')),
+    'feature_gates', json((SELECT json_group_object(name, json(json)) FROM entity_json WHERE kind = 'gate')),
+    'dynamic_configs', json((SELECT json_group_object(name, json(json)) FROM entity_json WHERE kind = 'config')),
+    'layer_configs', json((SELECT json_group_object(name, json(json)) FROM entity_json WHERE kind = 'layer')),
     'has_updates', json(CASE WHEN has_updates THEN 'true' ELSE 'false' END),
     'hash_used', hash_used,
     'time', lcut,
@@ -332,56 +356,42 @@ SELECT json_object(
 FROM session;
 
 
--- name: get_gate
--- checkGate: local override, else the served gate (by name, then by hashed name).
+-- name: get_value
+-- checkGate / getConfig / getParameterStore (:kind 'gate' | 'config' | 'param_store'): the local
+-- override, else the served entity (by name, then by hashed name). Same columns as lookup_result.
 INSERT INTO hash_input (algo, input)
   SELECT algo, :name FROM name_hash_algo
   WHERE algo IS NOT NULL
-    AND NOT EXISTS (SELECT 1 FROM entity WHERE kind = 'gate' AND name = :name)
+    AND NOT EXISTS (SELECT 1 FROM entity WHERE kind = :kind AND name = :name)
     AND NOT EXISTS (SELECT 1 FROM hash_memo AS m WHERE m.algo = name_hash_algo.algo AND m.input = :name);
-INSERT OR REPLACE INTO lookup (id, kind, name, override, spec, reason)
-  SELECT 1, 'gate', :name, o.value, e.spec,
-    CASE WHEN o.value IS NOT NULL THEN 'LocalOverride' WHEN e.spec IS NOT NULL THEN 'Recognized' ELSE 'Unrecognized' END
-  FROM name_hash_algo AS a
-    LEFT JOIN local_override AS o ON o.kind = 'gate' AND o.name = :name
-    LEFT JOIN entity AS e ON e.kind = 'gate' AND e.name = coalesce(
-      (SELECT name FROM entity WHERE kind = 'gate' AND name = :name),
-      (SELECT output FROM hash_memo AS m WHERE m.algo = a.algo AND m.input = :name));
-SELECT * FROM lookup_result;
-
-
--- name: get_config
--- getConfig: local override, else the served config. Never sticky.
-INSERT INTO hash_input (algo, input)
-  SELECT algo, :name FROM name_hash_algo
-  WHERE algo IS NOT NULL
-    AND NOT EXISTS (SELECT 1 FROM entity WHERE kind = 'config' AND name = :name)
-    AND NOT EXISTS (SELECT 1 FROM hash_memo AS m WHERE m.algo = name_hash_algo.algo AND m.input = :name);
-INSERT OR REPLACE INTO lookup (id, kind, name, override, spec, reason)
-  SELECT 1, 'config', :name, o.value, e.spec,
-    CASE WHEN o.value IS NOT NULL THEN 'LocalOverride' WHEN e.spec IS NOT NULL THEN 'Recognized' ELSE 'Unrecognized' END
-  FROM name_hash_algo AS a
-    LEFT JOIN local_override AS o ON o.kind = 'config' AND o.name = :name
-    LEFT JOIN entity AS e ON e.kind = 'config' AND e.name = coalesce(
-      (SELECT name FROM entity WHERE kind = 'config' AND name = :name),
-      (SELECT output FROM hash_memo AS m WHERE m.algo = a.algo AND m.input = :name));
-SELECT * FROM lookup_result;
-
-
--- name: get_param_store
-INSERT INTO hash_input (algo, input)
-  SELECT algo, :name FROM name_hash_algo
-  WHERE algo IS NOT NULL
-    AND NOT EXISTS (SELECT 1 FROM entity WHERE kind = 'param_store' AND name = :name)
-    AND NOT EXISTS (SELECT 1 FROM hash_memo AS m WHERE m.algo = name_hash_algo.algo AND m.input = :name);
-INSERT OR REPLACE INTO lookup (id, kind, name, override, spec, reason)
-  SELECT 1, 'param_store', :name, NULL, e.spec,
-    CASE WHEN e.spec IS NOT NULL THEN 'Recognized' ELSE 'Unrecognized' END
-  FROM name_hash_algo AS a
-    LEFT JOIN entity AS e ON e.kind = 'param_store' AND e.name = coalesce(
-      (SELECT name FROM entity WHERE kind = 'param_store' AND name = :name),
-      (SELECT output FROM hash_memo AS m WHERE m.algo = a.algo AND m.input = :name));
-SELECT * FROM lookup_result;
+SELECT
+  :kind AS kind,
+  :name AS name,
+  o.value IS NOT NULL AS overridden,
+  o.value IS NULL AND e.name IS NOT NULL AS found,
+  coalesce(o.value, e.value) AS value,
+  CASE WHEN o.value IS NOT NULL THEN 'override' WHEN e.name IS NULL THEN '' ELSE e.rule_id END AS rule_id,
+  CASE WHEN o.value IS NULL THEN e.group_name END AS group_name,
+  CASE WHEN o.value IS NULL THEN e.id_type END AS id_type,
+  CASE WHEN o.value IS NULL THEN e.secondary_exposures END AS secondary_exposures,
+  CASE WHEN o.value IS NULL THEN e.undelegated_secondary_exposures END AS undelegated_secondary_exposures,
+  CASE WHEN o.value IS NULL THEN coalesce(e.is_user_in_experiment, 0) ELSE 0 END AS is_user_in_experiment,
+  CASE WHEN o.value IS NULL THEN coalesce(e.is_experiment_active, 0) ELSE 0 END AS is_experiment_active,
+  CASE WHEN o.value IS NULL THEN coalesce(e.is_device_based, 0) ELSE 0 END AS is_device_based,
+  CASE WHEN o.value IS NULL THEN e.allocated_experiment_name END AS allocated_experiment_name,
+  CASE WHEN o.value IS NULL THEN e.explicit_parameters END AS explicit_parameters,
+  CASE WHEN o.value IS NULL THEN e.passed END AS rule_passed,
+  CASE WHEN o.value IS NULL THEN e.parameter_rule_ids END AS parameter_rule_ids,
+  s.source,
+  CASE WHEN o.value IS NOT NULL THEN 'LocalOverride' WHEN e.name IS NOT NULL THEN 'Recognized' ELSE 'Unrecognized' END AS reason,
+  s.lcut,
+  s.received_at
+FROM session AS s
+  LEFT JOIN name_hash_algo AS a
+  LEFT JOIN override AS o ON o.kind = :kind AND o.name = :name
+  LEFT JOIN entity AS e ON e.kind = :kind AND e.name = coalesce(
+    (SELECT name FROM entity WHERE kind = :kind AND name = :name),
+    (SELECT output FROM hash_memo AS m WHERE m.algo = a.algo AND m.input = :name));
 
 
 -- name: get_experiment
@@ -393,59 +403,79 @@ INSERT INTO hash_input (algo, input)
   SELECT algo, :name FROM name_hash_algo
   WHERE algo IS NOT NULL
     AND NOT EXISTS (SELECT 1 FROM hash_memo AS m WHERE m.algo = name_hash_algo.algo AND m.input = :name);
-INSERT OR REPLACE INTO lookup (id, kind, name, name_hash, override, latest, sticky, reason)
-  SELECT 1, :kind, :name, h.name_hash,
-    (SELECT value FROM local_override WHERE kind = :kind AND name = :name),
-    (SELECT spec FROM entity WHERE kind = :kind AND name IN (:name, h.name_hash)
-      ORDER BY name = :name DESC LIMIT 1),
+INSERT OR REPLACE INTO lookup (id, kind, name, entity_name, name_hash, override, reason, value,
+    rule_id, group_name, id_type, secondary_exposures, undelegated_secondary_exposures,
+    is_user_in_experiment, is_experiment_active, is_device_based, allocated_experiment_name,
+    explicit_parameters, passed, parameter_rule_ids, sticky)
+  SELECT 1, :kind, :name, e.name, h.name_hash,
+    (SELECT value FROM override WHERE kind = :kind AND name = :name),
+    '',
+    e.value, e.rule_id, e.group_name, e.id_type, e.secondary_exposures, e.undelegated_secondary_exposures,
+    e.is_user_in_experiment, e.is_experiment_active, e.is_device_based, e.allocated_experiment_name,
+    e.explicit_parameters, e.passed, e.parameter_rule_ids,
     coalesce(
       (SELECT spec FROM sticky_value WHERE owner = s.cache_key AND name_hash = h.name_hash),
-      (SELECT spec FROM sticky_value WHERE owner = '' AND name_hash = h.name_hash)),
-    ''
+      (SELECT spec FROM sticky_value WHERE owner = '' AND name_hash = h.name_hash))
   FROM session AS s,
     (SELECT coalesce((SELECT output FROM hash_memo AS m WHERE m.algo = a.algo AND m.input = :name), :name) AS name_hash
-     FROM name_hash_algo AS a) AS h;
+     FROM name_hash_algo AS a) AS h
+    LEFT JOIN entity AS e ON e.kind = :kind AND e.name = coalesce(
+      (SELECT name FROM entity WHERE kind = :kind AND name = :name), h.name_hash);
 UPDATE lookup SET latest_exp_active = coalesce(
   CASE WHEN kind = 'layer'
-    THEN (SELECT json_extract(spec, '$.is_experiment_active') FROM entity
+    THEN (SELECT is_experiment_active FROM entity
           WHERE kind = 'config' AND name = json_extract(lookup.sticky, '$.allocated_experiment_name'))
-    ELSE json_extract(latest, '$.is_experiment_active') END, 0);
+    ELSE is_experiment_active END, 0);
 -- drop the kept value: not wanted, or neither the kept nor the latest experiment is active
 DELETE FROM sticky_value
   WHERE name_hash = (SELECT name_hash FROM lookup)
     AND owner IN ((SELECT cache_key FROM session), '')
     AND EXISTS (SELECT 1 FROM lookup WHERE override IS NULL AND (
-      NOT :keep
-      OR (sticky IS NOT NULL AND NOT latest_exp_active
-          AND NOT coalesce(json_extract(latest, '$.is_experiment_active'), 0))));
--- keep the latest value: wanted, nothing kept (or the kept one is over), user in an active experiment
+      NOT :keep OR (sticky IS NOT NULL AND NOT latest_exp_active AND NOT coalesce(is_experiment_active, 0))));
+-- keep the latest value: wanted, nothing kept (or the kept experiment ended), user in an active experiment
 INSERT OR REPLACE INTO sticky_value (owner, name_hash, spec)
-  SELECT CASE WHEN json_extract(l.latest, '$.is_device_based') THEN '' ELSE s.cache_key END,
-    l.name_hash, l.latest
-  FROM lookup AS l, session AS s
-  WHERE l.override IS NULL AND :keep
-    AND json_extract(l.latest, '$.is_experiment_active')
-    AND json_extract(l.latest, '$.is_user_in_experiment')
+  SELECT CASE WHEN l.is_device_based THEN '' ELSE s.cache_key END, l.name_hash, j.json
+  FROM lookup AS l, session AS s JOIN entity_json AS j ON j.kind = l.kind AND j.name = l.entity_name
+  WHERE l.override IS NULL AND :keep AND l.is_experiment_active AND l.is_user_in_experiment
     AND (l.sticky IS NULL OR NOT l.latest_exp_active);
+-- serve the kept value while its experiment is active
 UPDATE lookup SET
-  spec = CASE WHEN override IS NULL AND :keep AND sticky IS NOT NULL AND latest_exp_active
-    THEN sticky ELSE latest END,
-  reason = CASE
+  entity_name = coalesce(entity_name, name_hash),
+  value = sticky -> '$.value',
+  rule_id = json_extract(sticky, '$.rule_id'),
+  group_name = json_extract(sticky, '$.group_name'),
+  id_type = json_extract(sticky, '$.id_type'),
+  secondary_exposures = sticky -> '$.secondary_exposures',
+  undelegated_secondary_exposures = sticky -> '$.undelegated_secondary_exposures',
+  is_user_in_experiment = coalesce(json_extract(sticky, '$.is_user_in_experiment'), 0),
+  is_experiment_active = coalesce(json_extract(sticky, '$.is_experiment_active'), 0),
+  is_device_based = coalesce(json_extract(sticky, '$.is_device_based'), 0),
+  allocated_experiment_name = json_extract(sticky, '$.allocated_experiment_name'),
+  explicit_parameters = sticky -> '$.explicit_parameters',
+  passed = json_extract(sticky, '$.passed'),
+  parameter_rule_ids = sticky -> '$.parameter_rule_ids',
+  reason = 'Sticky'
+  WHERE override IS NULL AND :keep AND sticky IS NOT NULL AND latest_exp_active;
+UPDATE lookup SET reason = CASE
     WHEN override IS NOT NULL THEN 'LocalOverride'
-    WHEN :keep AND sticky IS NOT NULL AND latest_exp_active THEN 'Sticky'
-    WHEN latest IS NOT NULL THEN 'Recognized'
-    ELSE 'Unrecognized' END;
+    WHEN entity_name IS NOT NULL THEN 'Recognized'
+    ELSE 'Unrecognized' END
+  WHERE reason = '';
 SELECT * FROM lookup_result;
 
 
 -- name: override_set
+-- Overrides apply to this client right away and are persisted for the next start.
+INSERT OR REPLACE INTO override (kind, name, value) VALUES (:kind, :name, :value);
 INSERT OR REPLACE INTO local_override (kind, name, value) VALUES (:kind, :name, :value);
 
 -- name: override_remove
+DELETE FROM override WHERE name = :name;
 DELETE FROM local_override WHERE name = :name;
 
 -- name: override_clear
+DELETE FROM override;
 DELETE FROM local_override;
 
 -- name: overrides
-SELECT kind, name, value FROM local_override ORDER BY kind, name;
+SELECT kind, name, value FROM override ORDER BY kind, name;
