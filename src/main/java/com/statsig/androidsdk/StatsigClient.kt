@@ -10,6 +10,8 @@ import com.statsig.androidsdk.sql.Row
 import com.statsig.androidsdk.sql.SqlDriver
 import com.statsig.androidsdk.sql.StatsigDb
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -24,6 +26,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 private const val DATABASE_NAME = "statsig.db"
+private const val LEGACY_PREFERENCES = "com.statsig.androidsdk"
 private const val FLUSH_INTERVAL_MS = 60_000L
 private const val MIN_POLLING_INTERVAL_MS = 60_000L
 
@@ -36,9 +39,13 @@ class StatsigClient : LifecycleEventListener {
     companion object {
         private const val TAG: String = "statsig::StatsigClient"
 
-        /** Opens the SQLite database for a client. Replaceable to use another SQLite build. */
-        @JvmSynthetic
-        internal var sqlDriverFactory: (Application) -> SqlDriver = { app ->
+        /**
+         * Opens the SQLite database for a client. The SDK's SQL needs SQLite 3.38 or newer (Android
+         * 14+ ships it); apps supporting older devices set this to a [SqlDriver] over a bundled
+         * SQLite (e.g. androidx.sqlite's BundledSQLiteDriver or requery's sqlite-android).
+         */
+        @JvmStatic
+        var sqlDriverFactory: (Application) -> SqlDriver = { app ->
             AndroidSqlDriver(app.getDatabasePath(DATABASE_NAME).apply { parentFile?.mkdirs() }.path)
         }
     }
@@ -70,7 +77,13 @@ class StatsigClient : LifecycleEventListener {
     internal var errorBoundary = ErrorBoundary(errorScope)
     private var statsigJob = SupervisorJob()
     internal lateinit var statsigScope: CoroutineScope
-    private val retryScope = CoroutineScope(SupervisorJob() + dispatcherProvider.io)
+
+    // Background retries are best effort: a failure must never reach the thread's handler.
+    private val retryScope = CoroutineScope(
+        SupervisorJob() + dispatcherProvider.io + CoroutineExceptionHandler { _, e ->
+            Log.w(TAG, "Retrying failed log requests failed", e)
+        }
+    )
     private val flushLock = Mutex()
     private var pollingJob: Job? = null
     private var flushTimer: Job? = null
@@ -96,7 +109,10 @@ class StatsigClient : LifecycleEventListener {
         options: StatsigOptions = StatsigOptions()
     ) {
         if (isInitializing.getAndSet(true)) {
-            Log.w(TAG, "initializeAsync() called on a client that is already started or starting - this is a no-op.")
+            Log.w(
+                TAG,
+                "initializeAsync() called on a client that is already started or starting - this is a no-op."
+            )
             return
         }
         errorBoundary.initialize(sdkKey, options.sdkErrorAPI)
@@ -136,7 +152,10 @@ class StatsigClient : LifecycleEventListener {
         options: StatsigOptions = StatsigOptions()
     ): InitializationDetails? {
         if (isInitializing.getAndSet(true)) {
-            Log.w(TAG, "initialize() called on a client that is already started or starting - this is a no-op.")
+            Log.w(
+                TAG,
+                "initialize() called on a client that is already started or starting - this is a no-op."
+            )
             return null
         }
         errorBoundary.initialize(sdkKey, options.sdkErrorAPI)
@@ -177,7 +196,10 @@ class StatsigClient : LifecycleEventListener {
         this.eventLoggingAPI = options.eventLoggingAPI
         this.lifetimeCallback = options.lifetimeCallback
         this.user = normalizeUser(user)
-        statsigScope = CoroutineScope(statsigJob + dispatcherProvider.main + errorBoundary.getExceptionHandler())
+        statsigScope =
+            CoroutineScope(
+                statsigJob + dispatcherProvider.main + errorBoundary.getExceptionHandler()
+            )
 
         db = StatsigDb(sqlDriverFactory(application))
         db.run(
@@ -189,12 +211,19 @@ class StatsigClient : LifecycleEventListener {
                 "options" to gson.toJson(options.getLoggingCopy())
             )
         )
+        importLegacyStorage()
         diagnostics = Diagnostics(db)
         diagnostics.markStart(KeyType.OVERALL, ContextType.INITIALIZE)
 
         connectivityListener = StatsigNetworkConnectivityListener(application)
-        network = StatsigNetwork(db, sdkKey, options, connectivityListener, statsigScope, diagnostics)
-        statsigClientMetadata = if (options.optOutNonSdkMetadata) createCoreStatsigMetadata() else createStatsigMetadata()
+        network =
+            StatsigNetwork(db, sdkKey, options, connectivityListener, statsigScope, diagnostics)
+        statsigClientMetadata =
+            if (options.optOutNonSdkMetadata) {
+                createCoreStatsigMetadata()
+            } else {
+                createStatsigMetadata()
+            }
         populateStatsigMetadata()
         errorBoundary.setMetadata(statsigClientMetadata)
 
@@ -204,14 +233,24 @@ class StatsigClient : LifecycleEventListener {
         flushTimer = statsigScope.launch(dispatcherProvider.io) {
             while (isActive) {
                 delay(FLUSH_INTERVAL_MS)
-                flushEvents()
+                try {
+                    flushEvents()
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    Log.w(TAG, "Periodic flush failed", e)
+                }
             }
         }
 
         if (!options.loadCacheAsync) {
             diagnostics.markStart(KeyType.INITIALIZE, ContextType.INITIALIZE, StepType.LOAD_CACHE)
             db.run("load_cache")
-            diagnostics.markEnd(KeyType.INITIALIZE, ContextType.INITIALIZE, true, StepType.LOAD_CACHE)
+            diagnostics.markEnd(
+                KeyType.INITIALIZE,
+                ContextType.INITIALIZE,
+                true,
+                StepType.LOAD_CACHE
+            )
         }
         options.initializeValues?.let {
             bootstrap(it)
@@ -226,16 +265,27 @@ class StatsigClient : LifecycleEventListener {
                 if (isBootstrapped.get()) {
                     val details = globalEvalDetails()
                     diagnostics.markEnd(
-                        KeyType.OVERALL, ContextType.INITIALIZE, details.source == EvalSource.Bootstrap,
+                        KeyType.OVERALL,
+                        ContextType.INITIALIZE,
+                        details.source == EvalSource.Bootstrap,
                         evaluationDetails = details
                     )
                     logDiagnostics(ContextType.INITIALIZE)
                     return@captureAsync InitializationDetails(0, true, null, details.source)
                 }
                 if (options.loadCacheAsync) {
-                    diagnostics.markStart(KeyType.INITIALIZE, ContextType.INITIALIZE, StepType.LOAD_CACHE)
+                    diagnostics.markStart(
+                        KeyType.INITIALIZE,
+                        ContextType.INITIALIZE,
+                        StepType.LOAD_CACHE
+                    )
                     db.run("load_cache")
-                    diagnostics.markEnd(KeyType.INITIALIZE, ContextType.INITIALIZE, true, StepType.LOAD_CACHE)
+                    diagnostics.markEnd(
+                        KeyType.INITIALIZE,
+                        ContextType.INITIALIZE,
+                        true,
+                        StepType.LOAD_CACHE
+                    )
                 }
                 val failure = if (options.initializeOffline) {
                     null
@@ -262,7 +312,11 @@ class StatsigClient : LifecycleEventListener {
                     0,
                     false,
                     InitializeResponse.FailedInitializeResponse(
-                        if (e is TimeoutCancellationException) InitializeFailReason.CoroutineTimeout else InitializeFailReason.InternalError,
+                        if (e is TimeoutCancellationException) {
+                            InitializeFailReason.CoroutineTimeout
+                        } else {
+                            InitializeFailReason.InternalError
+                        },
                         e
                     ),
                     initializationSource()
@@ -272,7 +326,9 @@ class StatsigClient : LifecycleEventListener {
     }
 
     /** Fetches values for the current user and stores them. Returns the failure, if any. */
-    private suspend fun fetchValues(context: ContextType): InitializeResponse.FailedInitializeResponse? {
+    private suspend fun fetchValues(
+        context: ContextType
+    ): InitializeResponse.FailedInitializeResponse? {
         val result = network.initialize(
             context,
             statsigClientMetadata,
@@ -283,7 +339,14 @@ class StatsigClient : LifecycleEventListener {
             return result.failure
         }
         diagnostics.markStart(KeyType.INITIALIZE, context, StepType.PROCESS)
-        saveValues(result)
+        try {
+            saveValues(result)
+        } catch (e: Exception) {
+            // e.g. a 200 response that is not JSON: an ordinary failed response, as before
+            diagnostics.markEnd(KeyType.INITIALIZE, context, false, StepType.PROCESS)
+            db.run("network_failed")
+            return InitializeResponse.FailedInitializeResponse(InitializeFailReason.NetworkError, e)
+        }
         diagnostics.markEnd(KeyType.INITIALIZE, context, true, StepType.PROCESS)
         return null
     }
@@ -291,7 +354,11 @@ class StatsigClient : LifecycleEventListener {
     private fun saveValues(result: StatsigNetwork.InitializeResult) {
         val saved = db.one(
             "save_values",
-            mapOf("payload" to result.payload, "user" to result.user, "scoped_key" to result.scopedKey)
+            mapOf(
+                "payload" to result.payload,
+                "user" to result.user,
+                "scoped_key" to result.scopedKey
+            )
         )
         if (saved?.bool("has_updates") == true && saved.bool("applied")) {
             statsigScope.launch(dispatcherProvider.main) { lifetimeCallback?.onValuesUpdated() }
@@ -305,20 +372,26 @@ class StatsigClient : LifecycleEventListener {
      * The value of a feature gate for the current user, logging an exposure.
      * @throws IllegalStateException if the SDK has not been initialized
      */
-    fun checkGate(gateName: String): Boolean = evaluateGate("checkGate", gateName, logExposure = true).getValue()
+    fun checkGate(gateName: String): Boolean =
+        evaluateGate("checkGate", gateName, logExposure = true).getValue()
 
-    fun checkGateWithExposureLoggingDisabled(gateName: String): Boolean =
-        evaluateGate("checkGateWithExposureLoggingDisabled", gateName, logExposure = false).getValue()
+    fun checkGateWithExposureLoggingDisabled(gateName: String): Boolean = evaluateGate(
+        "checkGateWithExposureLoggingDisabled",
+        gateName,
+        logExposure = false
+    ).getValue()
 
-    fun getFeatureGate(gateName: String): FeatureGate = evaluateGate("getFeatureGate", gateName, logExposure = true)
+    fun getFeatureGate(gateName: String): FeatureGate =
+        evaluateGate("getFeatureGate", gateName, logExposure = true)
 
     fun getFeatureGateWithExposureLoggingDisabled(gateName: String): FeatureGate =
         evaluateGate("getFeatureGateWithExposureLoggingDisabled", gateName, logExposure = false)
 
     /** A dynamic config for the current user, logging an exposure. */
-    fun getConfig(configName: String): DynamicConfig = evaluateConfig("getConfig", configName, true) {
-        getDynamicConfigEvaluation(configName)
-    }
+    fun getConfig(configName: String): DynamicConfig =
+        evaluateConfig("getConfig", configName, true) {
+            getDynamicConfigEvaluation(configName)
+        }
 
     fun getConfigWithExposureLoggingDisabled(configName: String): DynamicConfig =
         evaluateConfig("getConfigWithExposureLoggingDisabled", configName, false) {
@@ -337,16 +410,24 @@ class StatsigClient : LifecycleEventListener {
     fun getExperimentWithExposureLoggingDisabled(
         experimentName: String,
         keepDeviceValue: Boolean = false
-    ): DynamicConfig = evaluateConfig("getExperimentWithExposureLoggingDisabled", experimentName, false) {
-        getExperimentEvaluation(experimentName, keepDeviceValue)
-    }
+    ): DynamicConfig =
+        evaluateConfig("getExperimentWithExposureLoggingDisabled", experimentName, false) {
+            getExperimentEvaluation(experimentName, keepDeviceValue)
+        }
 
     /** A layer for the current user. Exposures are logged as its parameters are read. */
     fun getLayer(layerName: String, keepDeviceValue: Boolean = false): Layer =
         evaluateLayer("getLayer", layerName, keepDeviceValue, logExposure = true)
 
-    fun getLayerWithExposureLoggingDisabled(layerName: String, keepDeviceValue: Boolean = false): Layer =
-        evaluateLayer("getLayerWithExposureLoggingDisabled", layerName, keepDeviceValue, logExposure = false)
+    fun getLayerWithExposureLoggingDisabled(
+        layerName: String,
+        keepDeviceValue: Boolean = false
+    ): Layer = evaluateLayer(
+        "getLayerWithExposureLoggingDisabled",
+        layerName,
+        keepDeviceValue,
+        logExposure = false
+    )
 
     /** A parameter store for the current user. */
     fun getParameterStore(
@@ -354,12 +435,31 @@ class StatsigClient : LifecycleEventListener {
         options: ParameterStoreEvaluationOptions? = null
     ): ParameterStore {
         enforceInitialized("getParameterStore")
-        var paramStore = ParameterStore(this, HashMap(), parameterStoreName, globalEvalDetails(EvalReason.Unrecognized), options)
+        var paramStore = ParameterStore(
+            this,
+            HashMap(),
+            parameterStoreName,
+            EvalDetails(EvalSource.Error, EvalReason.Unrecognized),
+            options
+        )
         errorBoundary.capture(
             {
                 db.run("count_non_exposed", mapOf("name" to parameterStoreName))
-                val row = db.one("get_value", mapOf("kind" to "param_store", "name" to parameterStoreName))!!
-                paramStore = ParameterStore(this, jsonParamStore(row.string("value")), parameterStoreName, row.evalDetails(), options)
+                val row = db.one(
+                    "get_value",
+                    mapOf(
+                        "kind" to "param_store",
+                        "name" to parameterStoreName
+                    )
+                )!!
+                paramStore =
+                    ParameterStore(
+                        this,
+                        jsonParamStore(row.string("value")),
+                        parameterStoreName,
+                        row.evalDetails(),
+                        options
+                    )
                 paramStore = onDeviceEvalAdapter?.getParamStore(this, paramStore) ?: paramStore
             },
             tag = "getParameterStore",
@@ -368,7 +468,11 @@ class StatsigClient : LifecycleEventListener {
         return paramStore
     }
 
-    private fun evaluateGate(functionName: String, gateName: String, logExposure: Boolean): FeatureGate {
+    private fun evaluateGate(
+        functionName: String,
+        gateName: String,
+        logExposure: Boolean
+    ): FeatureGate {
         enforceInitialized(functionName)
         var result: FeatureGate? = null
         errorBoundary.capture(
@@ -407,13 +511,19 @@ class StatsigClient : LifecycleEventListener {
         return result
     }
 
-    private fun evaluateLayer(functionName: String, layerName: String, keepDeviceValue: Boolean, logExposure: Boolean): Layer {
+    private fun evaluateLayer(
+        functionName: String,
+        layerName: String,
+        keepDeviceValue: Boolean,
+        logExposure: Boolean
+    ): Layer {
         enforceInitialized(functionName)
         var layer = Layer.getError(layerName)
         errorBoundary.capture(
             {
                 if (!logExposure) db.run("count_non_exposed", mapOf("name" to layerName))
-                layer = getLayerEvaluation(if (logExposure) this else null, layerName, keepDeviceValue)
+                layer =
+                    getLayerEvaluation(if (logExposure) this else null, layerName, keepDeviceValue)
             },
             tag = functionName,
             configName = layerName
@@ -423,16 +533,25 @@ class StatsigClient : LifecycleEventListener {
     }
 
     private fun getFeatureGateEvaluation(gateName: String): FeatureGate {
-        val gate = db.one("get_value", mapOf("kind" to "gate", "name" to gateName))!!.toFeatureGate()
+        val gate = db.one(
+            "get_value",
+            mapOf("kind" to "gate", "name" to gateName)
+        )!!.toFeatureGate()
         return onDeviceEvalAdapter?.getGate(gate, user) ?: gate
     }
 
     private fun getDynamicConfigEvaluation(configName: String): DynamicConfig {
-        val config = db.one("get_value", mapOf("kind" to "config", "name" to configName))!!.toDynamicConfig()
+        val config = db.one(
+            "get_value",
+            mapOf("kind" to "config", "name" to configName)
+        )!!.toDynamicConfig()
         return onDeviceEvalAdapter?.getDynamicConfig(config, user) ?: config
     }
 
-    private fun getExperimentEvaluation(experimentName: String, keepDeviceValue: Boolean): DynamicConfig {
+    private fun getExperimentEvaluation(
+        experimentName: String,
+        keepDeviceValue: Boolean
+    ): DynamicConfig {
         val experiment = db.one(
             "get_experiment",
             mapOf("name" to experimentName, "kind" to "config", "keep" to keepDeviceValue)
@@ -440,7 +559,11 @@ class StatsigClient : LifecycleEventListener {
         return onDeviceEvalAdapter?.getDynamicConfig(experiment, user) ?: experiment
     }
 
-    private fun getLayerEvaluation(client: StatsigClient?, layerName: String, keepDeviceValue: Boolean): Layer {
+    private fun getLayerEvaluation(
+        client: StatsigClient?,
+        layerName: String,
+        keepDeviceValue: Boolean
+    ): Layer {
         val layer = db.one(
             "get_experiment",
             mapOf("name" to layerName, "kind" to "layer", "keep" to keepDeviceValue)
@@ -462,16 +585,19 @@ class StatsigClient : LifecycleEventListener {
 
     @JvmName("logEventWithAnyMetadata")
     fun logEvent(eventName: String, value: Double?, metadata: Map<String, Any>?) {
-        val eventMetadata = mutableMapOf<String, String>()
-        if (this::options.isInitialized) {
+        logCustomEvent(eventName, value, metadata) {
+            val eventMetadata = mutableMapOf<String, String>()
             if (!options.disableCurrentActivityLogging) {
-                lifecycleListener.getCurrentActivity()?.let { eventMetadata["currentPage"] = it.javaClass.simpleName }
+                lifecycleListener.getCurrentActivity()?.let {
+                    eventMetadata["currentPage"] =
+                        it.javaClass.simpleName
+                }
             }
             if (options.logNetworkMetadata) {
                 eventMetadata.putAll(connectivityListener.getLogEventNetworkMetadata())
             }
+            eventMetadata.ifEmpty { null }
         }
-        logCustomEvent(eventName, value, metadata, eventMetadata.ifEmpty { null })
     }
 
     @JvmOverloads
@@ -481,7 +607,7 @@ class StatsigClient : LifecycleEventListener {
 
     @JvmName("logEventWithAnyMetadata")
     fun logEvent(eventName: String, value: String, metadata: Map<String, Any>?) {
-        logCustomEvent(eventName, value, metadata, null)
+        logCustomEvent(eventName, value, metadata)
     }
 
     fun logEvent(eventName: String, metadata: Map<String, String>) {
@@ -490,13 +616,19 @@ class StatsigClient : LifecycleEventListener {
 
     @JvmName("logEventWithAnyMetadata")
     fun logEvent(eventName: String, metadata: Map<String, Any>) {
-        logCustomEvent(eventName, null, metadata, null)
+        logCustomEvent(eventName, null, metadata)
     }
 
-    private fun logCustomEvent(eventName: String, value: Any?, metadata: Map<String, Any>?, statsigMetadata: Map<String, String>?) {
+    private fun logCustomEvent(
+        eventName: String,
+        value: Any?,
+        metadata: Map<String, Any>?,
+        eventMetadata: () -> Map<String, String>? = { null }
+    ) {
         enforceInitialized("logEvent")
         errorBoundary.capture(
             {
+                val statsigMetadata = eventMetadata()
                 queued(
                     db.one(
                         "log_event",
@@ -519,10 +651,14 @@ class StatsigClient : LifecycleEventListener {
             db.one(
                 "log_gate_exposure",
                 mapOf(
-                    "name" to gate.getName(), "value" to gate.getValue(), "rule_id" to gate.getRuleID(),
+                    "name" to gate.getName(),
+                    "value" to gate.getValue(),
+                    "rule_id" to gate.getRuleID(),
                     "secondary" to toJson(gate.getSecondaryExposures()),
-                    "reason" to details.getDetailedReasonString(), "lcut" to details.lcut,
-                    "received_at" to details.receivedAt, "manual" to isManual
+                    "reason" to details.getDetailedReasonString(),
+                    "lcut" to details.lcut,
+                    "received_at" to details.receivedAt,
+                    "manual" to isManual
                 )
             )
         )
@@ -534,24 +670,38 @@ class StatsigClient : LifecycleEventListener {
             db.one(
                 "log_config_exposure",
                 mapOf(
-                    "name" to config.getName(), "rule_id" to config.getRuleID(),
+                    "name" to config.getName(),
+                    "rule_id" to config.getRuleID(),
                     "secondary" to toJson(config.getSecondaryExposures()),
-                    "reason" to details.getDetailedReasonString(), "lcut" to details.lcut,
-                    "received_at" to details.receivedAt, "rule_passed" to config.getRulePassed(),
+                    "reason" to details.getDetailedReasonString(),
+                    "lcut" to details.lcut,
+                    "received_at" to details.receivedAt,
+                    "rule_passed" to config.getRulePassed(),
                     "manual" to isManual
                 )
             )
         )
     }
 
-    internal fun logLayerParameterExposure(layer: Layer, parameterName: String, isManual: Boolean = false) {
+    internal fun logLayerParameterExposure(
+        layer: Layer,
+        parameterName: String,
+        isManual: Boolean = false
+    ) {
         if (!isInitialized()) return
+        errorBoundary.capture({
+            queueLayerExposure(layer, parameterName, isManual)
+        }, tag = "logLayerExposure")
+    }
+
+    private fun queueLayerExposure(layer: Layer, parameterName: String, isManual: Boolean) {
         val details = layer.getEvalDetails()
         queued(
             db.one(
                 "log_layer_exposure",
                 mapOf(
-                    "name" to layer.getName(), "rule_id" to layer.getRuleIDForParameter(parameterName),
+                    "name" to layer.getName(),
+                    "rule_id" to layer.getRuleIDForParameter(parameterName),
                     "parameter" to parameterName,
                     "explicit" to toJson(layer.getExplicitParameters()),
                     "allocated" to layer.getAllocatedExperimentName(),
@@ -564,13 +714,24 @@ class StatsigClient : LifecycleEventListener {
         )
     }
 
-    fun manuallyLogGateExposure(gateName: String) = manualExposure("logManualGateExposure", gateName) {
-        logGateExposure(db.one("get_value", mapOf("kind" to "gate", "name" to gateName))!!.toFeatureGate(), isManual = true)
-    }
+    fun manuallyLogGateExposure(gateName: String) =
+        manualExposure("logManualGateExposure", gateName) {
+            logGateExposure(
+                db.one("get_value", mapOf("kind" to "gate", "name" to gateName))!!.toFeatureGate(),
+                isManual = true
+            )
+        }
 
-    fun manuallyLogConfigExposure(configName: String) = manualExposure("logManualConfigExposure", configName) {
-        logConfigExposure(db.one("get_value", mapOf("kind" to "config", "name" to configName))!!.toDynamicConfig(), isManual = true)
-    }
+    fun manuallyLogConfigExposure(configName: String) =
+        manualExposure("logManualConfigExposure", configName) {
+            logConfigExposure(
+                db.one(
+                    "get_value",
+                    mapOf("kind" to "config", "name" to configName)
+                )!!.toDynamicConfig(),
+                isManual = true
+            )
+        }
 
     fun manuallyLogExperimentExposure(configName: String, keepDeviceValue: Boolean) =
         manualExposure("logManualExperimentExposure", configName) {
@@ -581,20 +742,27 @@ class StatsigClient : LifecycleEventListener {
             logConfigExposure(experiment, isManual = true)
         }
 
-    fun manuallyLogLayerParameterExposure(layerName: String, parameterName: String, keepDeviceValue: Boolean) =
-        manualExposure("logManualLayerExposure", layerName) {
-            val layer = db.one(
-                "get_experiment",
-                mapOf("name" to layerName, "kind" to "layer", "keep" to keepDeviceValue)
-            )!!.toLayer(null)
-            logLayerParameterExposure(layer, parameterName, isManual = true)
-        }
+    fun manuallyLogLayerParameterExposure(
+        layerName: String,
+        parameterName: String,
+        keepDeviceValue: Boolean
+    ) = manualExposure("logManualLayerExposure", layerName) {
+        val layer = db.one(
+            "get_experiment",
+            mapOf("name" to layerName, "kind" to "layer", "keep" to keepDeviceValue)
+        )!!.toLayer(null)
+        queueLayerExposure(layer, parameterName, isManual = true)
+    }
 
     fun manuallyLogGateExposure(gate: FeatureGate) =
-        manualExposure("logManualGateExposure", gate.getName()) { logGateExposure(gate, isManual = true) }
+        manualExposure("logManualGateExposure", gate.getName()) {
+            logGateExposure(gate, isManual = true)
+        }
 
     fun manuallyLogConfigExposure(config: DynamicConfig) =
-        manualExposure("logManualConfigExposure", config.getName()) { logConfigExposure(config, isManual = true) }
+        manualExposure("logManualConfigExposure", config.getName()) {
+            logConfigExposure(config, isManual = true)
+        }
 
     fun manuallyLogExperimentExposure(experiment: DynamicConfig) =
         manualExposure("logManualExperimentExposure", experiment.getName()) {
@@ -603,7 +771,7 @@ class StatsigClient : LifecycleEventListener {
 
     fun manuallyLogLayerParameterExposure(layer: Layer, parameterName: String) =
         manualExposure("logManualLayerExposure", layer.getName()) {
-            logLayerParameterExposure(layer, parameterName, isManual = true)
+            queueLayerExposure(layer, parameterName, isManual = true)
         }
 
     private fun manualExposure(functionName: String, name: String, log: () -> Unit) {
@@ -613,14 +781,21 @@ class StatsigClient : LifecycleEventListener {
 
     /** Flushes when the SQL says the queue is full. */
     private fun queued(row: Row?) {
-        if (row?.bool("should_flush") == true) statsigScope.launch(dispatcherProvider.io) { flushEvents() }
+        if (row?.bool("should_flush") ==
+            true
+        ) {
+            statsigScope.launch(dispatcherProvider.io) { flushEvents() }
+        }
     }
 
     private suspend fun flushEvents() {
         flushLock.withLock {
             val batch = db.one(
                 "take_batch",
-                mapOf("metadata" to toJson(statsigClientMetadata), "logging_enabled" to loggingEnabled)
+                mapOf(
+                    "metadata" to toJson(statsigClientMetadata),
+                    "logging_enabled" to loggingEnabled
+                )
             )
             if (batch == null) {
                 if (!loggingEnabled) Log.d(TAG, "loggingEnabled is FALSE, flush() skipped")
@@ -633,7 +808,11 @@ class StatsigClient : LifecycleEventListener {
     }
 
     private fun logDiagnostics(context: ContextType) {
-        if (diagnostics.logDiagnostics(context)) statsigScope.launch(dispatcherProvider.io) { flushEvents() }
+        if (diagnostics.logDiagnostics(context)) {
+            statsigScope.launch(dispatcherProvider.io) {
+                flushEvents()
+            }
+        }
     }
 
     suspend fun flush() {
@@ -663,7 +842,11 @@ class StatsigClient : LifecycleEventListener {
      * Switch to a new user (or the same user with new properties). Cached values for the user are
      * used right away; fresh values are fetched in the background unless [values] are given.
      */
-    fun updateUserAsync(user: StatsigUser?, callback: IStatsigCallback? = null, values: Map<String, Any>? = null) {
+    fun updateUserAsync(
+        user: StatsigUser?,
+        callback: IStatsigCallback? = null,
+        values: Map<String, Any>? = null
+    ) {
         enforceInitialized("updateUserAsync")
         errorBoundary.capture(
             {
@@ -766,12 +949,21 @@ class StatsigClient : LifecycleEventListener {
     private fun pollForUpdates() {
         if (!options.enableAutoValueUpdate) return
         pollingJob?.cancel()
-        val interval = maxOf((options.autoValueUpdateIntervalMinutes * 60 * 1000).toLong(), MIN_POLLING_INTERVAL_MS)
+        val interval =
+            maxOf(
+                (options.autoValueUpdateIntervalMinutes * 60 * 1000).toLong(),
+                MIN_POLLING_INTERVAL_MS
+            )
         pollingJob = statsigScope.launch(dispatcherProvider.io) {
             while (isActive) {
                 delay(interval)
                 try {
-                    val result = network.initialize(null, statsigClientMetadata, HashAlgorithm.DJB2, poll = true)
+                    val result = network.initialize(
+                        null,
+                        statsigClientMetadata,
+                        HashAlgorithm.DJB2,
+                        poll = true
+                    )
                     if (result.payload != null) saveValues(result)
                 } catch (e: Exception) {
                     Log.e(TAG, "Init Polling Error", e)
@@ -806,7 +998,8 @@ class StatsigClient : LifecycleEventListener {
     // Overrides
 
     /** @param value the result to be returned when checkGate is called */
-    fun overrideGate(gateName: String, value: Boolean) = setOverride("overrideGate", "gate", gateName, value)
+    fun overrideGate(gateName: String, value: Boolean) =
+        setOverride("overrideGate", "gate", gateName, value)
 
     /** @param value the values to be returned when getConfig or getExperiment is called */
     fun overrideConfig(configName: String, value: Map<String, Any>) =
@@ -819,7 +1012,14 @@ class StatsigClient : LifecycleEventListener {
     private fun setOverride(functionName: String, kind: String, name: String, value: Any) {
         errorBoundary.capture(
             {
-                db.run("override_set", mapOf("kind" to kind, "name" to name, "value" to gson.toJson(value)))
+                db.run(
+                    "override_set",
+                    mapOf(
+                        "kind" to kind,
+                        "name" to name,
+                        "value" to gson.toJson(value)
+                    )
+                )
                 Log.v(TAG, "$functionName() completed")
             },
             tag = functionName
@@ -828,7 +1028,9 @@ class StatsigClient : LifecycleEventListener {
 
     /** Clears any override of a gate, config, experiment or layer with this name. */
     fun removeOverride(name: String) {
-        errorBoundary.capture({ db.run("override_remove", mapOf("name" to name)) }, tag = "removeOverride")
+        errorBoundary.capture({
+            db.run("override_remove", mapOf("name" to name))
+        }, tag = "removeOverride")
     }
 
     /** Throw away all overridden values */
@@ -919,22 +1121,27 @@ class StatsigClient : LifecycleEventListener {
         initialized.set(false)
         pollingJob?.cancel()
         flushTimer?.cancel()
-        flushEvents()
-        lifecycleListener.shutdown()
-        statsigJob.cancel()
-        synchronized(db) { db.close() }
-        isBootstrapped.set(false)
-        errorBoundary = ErrorBoundary(errorScope)
-        statsigJob = SupervisorJob()
-        isInitializing.set(false)
-        Log.v(TAG, "shutdown completed.")
+        try {
+            flushEvents()
+        } finally {
+            lifecycleListener.shutdown()
+            statsigJob.cancel()
+            db.close()
+            isBootstrapped.set(false)
+            errorBoundary = ErrorBoundary(errorScope)
+            statsigJob = SupervisorJob()
+            isInitializing.set(false)
+            Log.v(TAG, "shutdown completed.")
+        }
     }
 
     fun isInitialized(): Boolean = initialized.get()
 
     internal fun enforceInitialized(functionName: String) {
         if (!initialized.get()) {
-            throw IllegalStateException("The SDK must be initialized prior to invoking $functionName")
+            throw IllegalStateException(
+                "The SDK must be initialized prior to invoking $functionName"
+            )
         }
     }
 
@@ -964,13 +1171,20 @@ class StatsigClient : LifecycleEventListener {
     private fun globalEvalDetails(reason: EvalReason? = null): EvalDetails =
         db.one("session_state")!!.evalDetails().apply { this.reason = reason }
 
-    private fun initializationSource(): EvalSource =
-        if (this::db.isInitialized) globalEvalDetails().source else EvalSource.Error
+    /** For failure paths: must not throw, whatever state the database is in. */
+    private fun initializationSource(): EvalSource = try {
+        db.run("session_state").firstOrNull()?.evalDetails()?.source ?: EvalSource.Error
+    } catch (e: Exception) {
+        EvalSource.Error
+    }
 
     private fun failedInitialization(e: Exception?) = InitializationDetails(
         duration = SystemClock.elapsedRealtime() - initTime,
         success = false,
-        failureDetails = InitializeResponse.FailedInitializeResponse(InitializeFailReason.InternalError, e),
+        failureDetails = InitializeResponse.FailedInitializeResponse(
+            InitializeFailReason.InternalError,
+            e
+        ),
         source = initializationSource()
     )
 
@@ -982,8 +1196,23 @@ class StatsigClient : LifecycleEventListener {
         }
     }
 
+    /** Carries the stable ID, overrides and device sticky values over from SDK versions < 6. */
+    private fun importLegacyStorage() {
+        if (db.one("legacy_import_pending")?.bool("pending") != true) return
+        val prefs = application.getSharedPreferences(LEGACY_PREFERENCES, Context.MODE_PRIVATE)
+        db.run(
+            "legacy_import",
+            mapOf(
+                "stable_id" to prefs?.getString("STABLE_ID", null),
+                "overrides" to prefs?.getString("Statsig.LOCAL_OVERRIDES", null),
+                "device_sticky" to prefs?.getString("Statsig.STICKY_DEVICE_EXPERIMENTS", null)
+            )
+        )
+    }
+
     private fun populateStatsigMetadata() {
-        statsigClientMetadata.stableID = options.overrideStableID ?: db.one("stable_id")!!.string("stable_id")
+        statsigClientMetadata.stableID =
+            options.overrideStableID ?: db.one("stable_id")!!.string("stable_id")
         try {
             if (application.packageManager != null && !options.optOutNonSdkMetadata) {
                 val info = application.packageManager.getPackageInfo(application.packageName, 0)
@@ -1001,7 +1230,9 @@ class StatsigClient : LifecycleEventListener {
         failure: InitializeResponse.FailedInitializeResponse?
     ) {
         diagnostics.markEnd(
-            KeyType.OVERALL, context, success,
+            KeyType.OVERALL,
+            context,
+            success,
             evaluationDetails = globalEvalDetails(),
             error = failure?.let { Diagnostics.formatFailedResponse(it) }
         )
@@ -1012,7 +1243,9 @@ class StatsigClient : LifecycleEventListener {
         try {
             if (this::diagnostics.isInitialized) {
                 diagnostics.markEnd(
-                    KeyType.OVERALL, context, false,
+                    KeyType.OVERALL,
+                    context,
+                    false,
                     evaluationDetails = globalEvalDetails(),
                     error = Marker.ErrorMessage(message = "${e?.javaClass?.name}: ${e?.message}")
                 )

@@ -163,13 +163,13 @@ INSERT INTO event_queue (dedupe_key, event)
     'time', now_ms)
   FROM clock WHERE EXISTS (SELECT 1 FROM non_exposed);
 DELETE FROM non_exposed;
+DELETE FROM hash_memo WHERE rowid <= (SELECT max(rowid) FROM hash_memo) - 2048;
 DELETE FROM batch;
 INSERT INTO batch (max_id, n, body)
   SELECT max(id), count(*),
     json_object('events', json_group_array(json(event)), 'statsigMetadata', json(:metadata))
   FROM (SELECT id, event FROM event_queue ORDER BY id)
-  WHERE :logging_enabled
-  HAVING count(*) > 0;
+  WHERE :logging_enabled AND EXISTS (SELECT 1 FROM event_queue);
 DELETE FROM event_queue WHERE id <= (SELECT max_id FROM batch);
 SELECT body, n FROM batch;
 

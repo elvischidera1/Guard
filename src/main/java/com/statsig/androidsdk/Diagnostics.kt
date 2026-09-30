@@ -58,7 +58,8 @@ internal class Diagnostics(private val db: StatsigDb) {
                 "status_code" to statusCode,
                 "error" to error?.let { gson.toJson(it) },
                 "has_network" to hasNetwork,
-                "evaluation_details" to evaluationDetails?.let { gson.toJson(it.toLoggingEvaluationDetails()) }
+                "evaluation_details" to
+                    evaluationDetails?.let { gson.toJson(it.toLoggingEvaluationDetails()) }
             )
         )
     }
@@ -67,10 +68,11 @@ internal class Diagnostics(private val db: StatsigDb) {
     private fun wire(value: Enum<*>): String = gson.toJson(value).trim('"')
 
     companion object {
-        fun formatFailedResponse(failure: InitializeResponse.FailedInitializeResponse): Marker.ErrorMessage =
-            Marker.ErrorMessage(
-                message = "${failure.reason} : ${failure.exception?.message}",
-                name = failure.exception?.javaClass?.toString() ?: "unknown"
-            )
+        fun formatFailedResponse(
+            failure: InitializeResponse.FailedInitializeResponse
+        ): Marker.ErrorMessage = Marker.ErrorMessage(
+            message = "${failure.reason} : ${failure.exception?.message}",
+            name = failure.exception?.javaClass?.toString() ?: "unknown"
+        )
     }
 }

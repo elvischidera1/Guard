@@ -2,6 +2,10 @@
 
 -- name: schema
 
+-- The shared "values" and "exposures" tables of an init-v2 payload, by id, while it is applied.
+CREATE TEMP TABLE IF NOT EXISTS v2_value (id TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID;
+CREATE TEMP TABLE IF NOT EXISTS v2_exposure (id TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID;
+
 -- IDs compared by the bootstrap block.
 CREATE TEMP TABLE IF NOT EXISTS bootstrap_user_ids (key TEXT, value TEXT);
 CREATE TEMP TABLE IF NOT EXISTS bootstrap_evaluated_ids (key TEXT, value TEXT);
@@ -64,21 +68,30 @@ BEGIN
     SELECT 'param_store', key, value FROM json_each(NEW.payload, '$.param_stores') WHERE type = 'object';
 
   -- init-v2 (compact bootstrap format): short keys; values and exposures are shared through
-  -- lookup tables referenced by id.
+  -- lookup tables referenced by id (read once into v2_value / v2_exposure).
+  DELETE FROM v2_value;
+  DELETE FROM v2_exposure;
+  INSERT OR REPLACE INTO v2_value (id, value)
+    SELECT key, value FROM json_each(NEW.payload, '$.values')
+    WHERE json_extract(NEW.payload, '$.response_format') = 'init-v2';
+  INSERT OR REPLACE INTO v2_exposure (id, value)
+    SELECT key, value FROM json_each(NEW.payload, '$.exposures')
+    WHERE json_extract(NEW.payload, '$.response_format') = 'init-v2';
   INSERT OR REPLACE INTO entity (kind, name, value, rule_id, group_name, id_type, secondary_exposures,
       undelegated_secondary_exposures, is_user_in_experiment, is_experiment_active, is_device_based,
       allocated_experiment_name, explicit_parameters, passed, parameter_rule_ids)
     SELECT k.kind, e.key,
       CASE WHEN k.kind = 'gate' THEN CASE WHEN json_extract(e.value, '$.v') THEN 'true' ELSE 'false' END
-        ELSE coalesce((SELECT v.value FROM json_each(NEW.payload, '$.values') AS v
-                       WHERE v.key = json_extract(e.value, '$.v')), '{}') END,
+        ELSE coalesce((SELECT value FROM v2_value WHERE id = CAST(json_extract(e.value, '$.v') AS TEXT)), '{}') END,
       coalesce(json_extract(e.value, '$.r'), 'default'),
       json_extract(e.value, '$.gn'),
       json_extract(e.value, '$.i'),
-      (SELECT json_group_array(json(x.value)) FROM json_each(e.value, '$.s') AS i
-         JOIN json_each(NEW.payload, '$.exposures') AS x ON x.key = i.value),
-      (SELECT json_group_array(json(x.value)) FROM json_each(e.value, '$.us') AS i
-         JOIN json_each(NEW.payload, '$.exposures') AS x ON x.key = i.value),
+      (SELECT json_group_array(json(value)) FROM (
+         SELECT x.value FROM json_each(e.value, '$.s') AS i JOIN v2_exposure AS x ON x.id = CAST(i.value AS TEXT)
+         ORDER BY i.key)),
+      (SELECT json_group_array(json(value)) FROM (
+         SELECT x.value FROM json_each(e.value, '$.us') AS i JOIN v2_exposure AS x ON x.id = CAST(i.value AS TEXT)
+         ORDER BY i.key)),
       coalesce(json_extract(e.value, '$.ue'), 0),
       coalesce(json_extract(e.value, '$.ea'), 0),
       coalesce(json_extract(e.value, '$.d'), 0),
@@ -91,6 +104,8 @@ BEGIN
           UNION ALL SELECT 'layer', '$.layer_configs') AS k,
       json_each(NEW.payload, k.path) AS e
     WHERE e.type = 'object' AND json_extract(NEW.payload, '$.response_format') = 'init-v2';
+  DELETE FROM v2_value;
+  DELETE FROM v2_exposure;
 
   DELETE FROM values_work;
 END;
@@ -205,6 +220,7 @@ SELECT value AS stable_id FROM setting WHERE key = 'stable_id';
 
 -- name: set_user
 -- updateUser: switch the session to another user. Values stay until load_cache replaces them.
+DELETE FROM hash_memo WHERE rowid <= (SELECT max(rowid) FROM hash_memo) - 2048;
 INSERT INTO hash_input (algo, input)
   SELECT 'djb2', :user
   WHERE NOT EXISTS (SELECT 1 FROM hash_memo WHERE algo = 'djb2' AND input = :user);
@@ -479,3 +495,24 @@ DELETE FROM local_override;
 
 -- name: overrides
 SELECT kind, name, value FROM override ORDER BY kind, name;
+
+
+-- name: legacy_import_pending
+-- Whether data of the SharedPreferences-based SDK versions still has to be imported (once).
+SELECT NOT EXISTS (SELECT 1 FROM setting WHERE key = 'legacy_imported') AS pending;
+
+-- name: legacy_import
+-- One-time import from the SharedPreferences-based SDK: the stable ID (so upgraded devices keep
+-- their identity), local overrides ({"gates": .., "configs": .., "layers": ..}) and device-based
+-- sticky experiments ({name hash: experiment}). Cached values are simply fetched again.
+INSERT OR IGNORE INTO setting (key, value) SELECT 'stable_id', :stable_id WHERE :stable_id IS NOT NULL;
+INSERT OR IGNORE INTO local_override (kind, name, value)
+  SELECT k.kind, o.key, CASE WHEN k.kind = 'gate' THEN CASE WHEN o.value THEN 'true' ELSE 'false' END ELSE o.value END
+  FROM (SELECT 'gate' AS kind, '$.gates' AS path UNION ALL SELECT 'config', '$.configs'
+        UNION ALL SELECT 'layer', '$.layers') AS k,
+    json_each(CASE WHEN json_valid(:overrides) THEN :overrides ELSE '{}' END, k.path) AS o;
+INSERT OR IGNORE INTO sticky_value (owner, name_hash, spec)
+  SELECT '', key, value FROM json_each(CASE WHEN json_valid(:device_sticky) THEN :device_sticky ELSE '{}' END)
+  WHERE type = 'object';
+INSERT OR REPLACE INTO override (kind, name, value) SELECT kind, name, value FROM local_override;
+INSERT OR REPLACE INTO setting (key, value) VALUES ('legacy_imported', '1');

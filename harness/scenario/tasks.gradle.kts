@@ -20,8 +20,3 @@ tasks.register<JavaExec>("bench") {
 }
 
 
-tasks.register<JavaExec>("probe") {
-    classpath = testSourceSet.runtimeClasspath
-    mainClass.set("harness.probe.ProbeKt")
-    jvmArgs("-XX:StartFlightRecording=filename=${layout.buildDirectory.file("probe.jfr").get().asFile.path},settings=profile")
-}

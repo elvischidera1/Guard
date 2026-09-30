@@ -149,10 +149,7 @@ BEGIN
   DELETE FROM hash_input;
 END;
 
--- Keeps the memo bounded (like the original BoundedMemo): every 256 inserts, rows older than the
--- last 2048 are dropped. Recent rows (the ones a running statement relies on) are never dropped.
-CREATE TEMP TRIGGER IF NOT EXISTS hash_memo_bound AFTER INSERT ON hash_memo
-WHEN NEW.rowid % 256 = 0
-BEGIN
-  DELETE FROM hash_memo WHERE rowid <= NEW.rowid - 2048;
-END;
+-- name: trim_hash_memo
+-- Keeps the memo bounded (like the original BoundedMemo): only the newest 2048 hashes stay.
+-- Run between blocks, never while a block still relies on the hashes it just computed.
+DELETE FROM hash_memo WHERE rowid <= (SELECT max(rowid) FROM hash_memo) - 2048;

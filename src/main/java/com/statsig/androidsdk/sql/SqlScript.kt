@@ -56,7 +56,11 @@ internal class SqlScript private constructor(val blocks: Map<String, List<Statem
                     }
                     if (block == null) continue
                     // comments between statements are not part of any statement
-                    if (current.isEmpty() && (line.isBlank() || line.trimStart().startsWith("--"))) continue
+                    if (current.isEmpty() &&
+                        (line.isBlank() || line.trimStart().startsWith("--"))
+                    ) {
+                        continue
+                    }
                     current.add(line)
                     val isTrigger = CREATE_TRIGGER.containsMatchIn(current.first().trimStart())
                     val ends = if (isTrigger) {
@@ -88,8 +92,15 @@ internal class SqlScript private constructor(val blocks: Map<String, List<Statem
                         val end = sql.indexOf('\n', i).let { if (it < 0) sql.length else it }
                         i = end
                     }
-                    c == ':' && i + 1 < sql.length && (sql[i + 1].isLetter() || sql[i + 1] == '_') &&
-                        (i == 0 || !(sql[i - 1].isLetterOrDigit() || sql[i - 1] == '_' || sql[i - 1] == ':')) -> {
+                    c == ':' && i + 1 < sql.length &&
+                        (sql[i + 1].isLetter() || sql[i + 1] == '_') &&
+                        (
+                            i == 0 ||
+                                !(
+                                    sql[i - 1].isLetterOrDigit() || sql[i - 1] == '_' ||
+                                        sql[i - 1] == ':'
+                                    )
+                            ) -> {
                         var j = i + 1
                         while (j < sql.length && (sql[j].isLetterOrDigit() || sql[j] == '_')) j++
                         params.add(sql.substring(i + 1, j))

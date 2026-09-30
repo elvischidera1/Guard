@@ -48,8 +48,9 @@ class HashingTest {
     fun memo_stays_bounded_and_keeps_recent_entries() {
         val db = newDb()
         for (i in 0 until 3000) db.exec("INSERT INTO hash_input (algo, input) VALUES ('djb2', 'n$i')")
-        val size = db.scalar("SELECT count(*) FROM hash_memo") as Long
-        assert(size in 1..2304) { "memo size $size" }
+        assertEquals(3000L, db.scalar("SELECT count(*) FROM hash_memo"))
+        db.run("trim_hash_memo")
+        assertEquals(2048L, db.scalar("SELECT count(*) FROM hash_memo"))
         assertEquals(djb2("n2999"), db.scalar("SELECT output FROM hash_memo WHERE input = 'n2999'"))
     }
 }

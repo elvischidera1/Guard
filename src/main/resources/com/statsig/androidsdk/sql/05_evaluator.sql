@@ -199,10 +199,15 @@ SELECT x.*,
   -- getValueAsDouble: numbers, or strings that parse as numbers
   CASE WHEN x.vtype IN ('integer', 'real') THEN x.v ->> '$'
        WHEN x.vtype = 'bucket' THEN CAST(x.v AS INTEGER)
-       WHEN x.vtype = 'text' AND json_valid(trim(x.v ->> '$')) AND json_type(trim(x.v ->> '$')) IN ('integer', 'real')
+       -- a decimal number (Kotlin's toDoubleOrNull; not SQLite's JSON parser, which varies by version)
+       WHEN x.vtype = 'text' AND (CASE WHEN instr(lower(CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END), 'e') > 0 THEN substr(CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END, 1, instr(lower(CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END), 'e') - 1) ELSE CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END END) GLOB '*[0-9]*' AND (CASE WHEN instr(lower(CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END), 'e') > 0 THEN substr(CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END, 1, instr(lower(CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END), 'e') - 1) ELSE CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END END) NOT GLOB '*[^0-9.]*' AND (CASE WHEN instr(lower(CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END), 'e') > 0 THEN substr(CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END, 1, instr(lower(CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END), 'e') - 1) ELSE CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END END) NOT GLOB '*.*.*'
+           AND ((CASE WHEN instr(lower(CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END), 'e') > 0 THEN substr(CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END, instr(lower(CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END), 'e') + 1) END) IS NULL OR (ltrim((CASE WHEN instr(lower(CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END), 'e') > 0 THEN substr(CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END, instr(lower(CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END), 'e') + 1) END), '+-') GLOB '[0-9]*' AND ltrim((CASE WHEN instr(lower(CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END), 'e') > 0 THEN substr(CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END, instr(lower(CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END), 'e') + 1) END), '+-') NOT GLOB '*[^0-9]*'
+             AND length((CASE WHEN instr(lower(CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END), 'e') > 0 THEN substr(CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END, instr(lower(CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END), 'e') + 1) END)) - length(ltrim((CASE WHEN instr(lower(CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END), 'e') > 0 THEN substr(CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END, instr(lower(CASE WHEN substr(trim(x.v ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.v ->> '$'), 2) ELSE trim(x.v ->> '$') END), 'e') + 1) END), '+-')) <= 1))
          THEN CAST(trim(x.v ->> '$') AS REAL) END AS vnum,
   CASE WHEN json_type(x.target) IN ('integer', 'real') THEN x.target ->> '$'
-       WHEN json_type(x.target) = 'text' AND json_valid(trim(x.target ->> '$')) AND json_type(trim(x.target ->> '$')) IN ('integer', 'real')
+       WHEN json_type(x.target) = 'text' AND (CASE WHEN instr(lower(CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END), 'e') > 0 THEN substr(CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END, 1, instr(lower(CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END), 'e') - 1) ELSE CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END END) GLOB '*[0-9]*' AND (CASE WHEN instr(lower(CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END), 'e') > 0 THEN substr(CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END, 1, instr(lower(CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END), 'e') - 1) ELSE CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END END) NOT GLOB '*[^0-9.]*' AND (CASE WHEN instr(lower(CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END), 'e') > 0 THEN substr(CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END, 1, instr(lower(CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END), 'e') - 1) ELSE CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END END) NOT GLOB '*.*.*'
+           AND ((CASE WHEN instr(lower(CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END), 'e') > 0 THEN substr(CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END, instr(lower(CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END), 'e') + 1) END) IS NULL OR (ltrim((CASE WHEN instr(lower(CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END), 'e') > 0 THEN substr(CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END, instr(lower(CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END), 'e') + 1) END), '+-') GLOB '[0-9]*' AND ltrim((CASE WHEN instr(lower(CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END), 'e') > 0 THEN substr(CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END, instr(lower(CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END), 'e') + 1) END), '+-') NOT GLOB '*[^0-9]*'
+             AND length((CASE WHEN instr(lower(CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END), 'e') > 0 THEN substr(CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END, instr(lower(CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END), 'e') + 1) END)) - length(ltrim((CASE WHEN instr(lower(CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END), 'e') > 0 THEN substr(CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END, instr(lower(CASE WHEN substr(trim(x.target ->> '$'), 1, 1) IN ('+', '-') THEN substr(trim(x.target ->> '$'), 2) ELSE trim(x.target ->> '$') END), 'e') + 1) END), '+-')) <= 1))
          THEN CAST(trim(x.target ->> '$') AS REAL) END AS tnum,
   -- dates: epoch seconds or milliseconds (as numbers or digit strings), else yyyy-MM-ddTHH:mm:ss.SSSZ (UTC)
   CASE WHEN x.vtype IN ('integer', 'real') OR (x.vtype = 'text' AND (x.v ->> '$') GLOB '[0-9]*' AND NOT (x.v ->> '$') GLOB '*[^0-9]*')
@@ -318,6 +323,9 @@ DELETE FROM eval_user;
 DELETE FROM eval_needed;
 DELETE FROM eval_cond;
 DELETE FROM eval_result;
+DELETE FROM hash_memo WHERE rowid <= (SELECT max(rowid) FROM hash_memo) - 2048;
+-- regex answers are memoized per (pattern, value); keep the memo bounded
+DELETE FROM regex_request WHERE (SELECT count(*) FROM regex_request) > 1000;
 INSERT INTO eval_user (id, user, now_ms) SELECT 1, :user, now_ms FROM clock;
 INSERT INTO eval_needed (kind, name)
   WITH RECURSIVE need(kind, name) AS (
@@ -337,7 +345,7 @@ DELETE FROM eval_cond_ctx;
 INSERT INTO eval_rule_ctx (kind, spec_name, idx, bucket_input)
   SELECT r.kind, r.spec_name, r.idx,
     coalesce(json_extract(s.spec, '$.salt'), 'null') || '.'
-    || coalesce(json_extract(r.rule, '$.salt'), json_extract(r.rule, '$.id')) || '.'
+    || coalesce(json_extract(r.rule, '$.salt'), json_extract(r.rule, '$.id'), 'null') || '.'
     || coalesce(CASE WHEN lower(json_extract(r.rule, '$.idType')) <> 'userid' AND json_extract(r.rule, '$.idType') <> ''
          THEN coalesce(json_extract(u.user, '$.customIDs."' || json_extract(r.rule, '$.idType') || '"'),
                        json_extract(u.user, '$.customIDs."' || lower(json_extract(r.rule, '$.idType')) || '"'))
@@ -351,9 +359,9 @@ INSERT INTO eval_cond_ctx (kind, spec_name, rule_idx, idx, type, operator, field
   SELECT kind, spec_name, rule_idx, idx, type, operator, field, target, ref_gate, path, unit_id, bucket_input
   FROM eval_cond_field;
 INSERT INTO hash_input (algo, input)
+  -- user_bucket conditions; rule pass percentages are hashed by eval_step, decisive rules only
   SELECT DISTINCT 'bucket', b.input FROM (
-    SELECT bucket_input AS input FROM eval_rule_ctx
-    UNION SELECT bucket_input FROM eval_cond_ctx WHERE bucket_input IS NOT NULL) AS b
+    SELECT bucket_input AS input FROM eval_cond_ctx WHERE bucket_input IS NOT NULL) AS b
   WHERE NOT EXISTS (SELECT 1 FROM hash_memo AS m WHERE m.algo = 'bucket' AND m.input = b.input);
 INSERT OR IGNORE INTO regex_request (pattern, value)
   SELECT tstr, vstr FROM eval_cond_value
@@ -459,7 +467,7 @@ INSERT INTO eval_cond (kind, spec_name, rule_idx, idx, pass, unsupported, exposu
   SELECT c.kind, c.spec_name, c.rule_idx, c.idx,
     CASE WHEN c.type = 'pass_gate' THEN r.bool ELSE NOT r.bool END,
     0,
-    CASE WHEN c.ref_gate LIKE 'segment:%' THEN r.secondary
+    CASE WHEN substr(c.ref_gate, 1, 8) = 'segment:' THEN r.secondary
       ELSE json_insert(r.secondary, '$[#]', json_object(
         'gate', c.ref_gate,
         'gateValue', CASE WHEN r.bool THEN 'true' ELSE 'false' END,
@@ -469,6 +477,37 @@ INSERT INTO eval_cond (kind, spec_name, rule_idx, idx, pass, unsupported, exposu
   WHERE c.ref_gate IS NOT NULL
     AND NOT EXISTS (SELECT 1 FROM eval_cond AS x
       WHERE x.kind = c.kind AND x.spec_name = c.spec_name AND x.rule_idx = c.rule_idx AND x.idx = c.idx);
+-- the pass-percentage hash of each decisive rule (only those: SHA-256 in SQL is not cheap)
+INSERT INTO hash_input (algo, input)
+  WITH
+    -- needed specs not evaluated yet whose conditions and delegates all are
+    ready AS (
+      SELECT n.kind, n.name, sp.spec
+      FROM eval_needed AS n JOIN dcs_spec AS sp ON sp.kind = n.kind AND sp.name = n.name
+      WHERE NOT EXISTS (SELECT 1 FROM eval_result AS r WHERE r.kind = n.kind AND r.name = n.name)
+        AND NOT EXISTS (SELECT 1 FROM eval_cond_ctx AS c
+          WHERE c.kind = n.kind AND c.spec_name = n.name AND NOT EXISTS (
+            SELECT 1 FROM eval_cond AS ec
+            WHERE ec.kind = c.kind AND ec.spec_name = c.spec_name AND ec.rule_idx = c.rule_idx AND ec.idx = c.idx))
+        AND NOT EXISTS (SELECT 1 FROM dcs_edge AS e
+          WHERE e.kind = n.kind AND e.name = n.name AND e.dep_kind = 'config'
+            AND NOT EXISTS (SELECT 1 FROM eval_result AS r WHERE r.kind = 'config' AND r.name = e.dep_name))
+    ),
+    -- per rule: do all its conditions pass, does any hit something unsupported
+    rule_status AS (
+      SELECT r.kind, r.spec_name, r.idx, r.rule,
+        coalesce(min(ec.pass), 1) AS all_pass,
+        coalesce(max(ec.unsupported), 0) AS any_unsupported
+      FROM ready
+        JOIN dcs_rule AS r ON r.kind = ready.kind AND r.spec_name = ready.name
+        LEFT JOIN eval_cond AS ec ON ec.kind = r.kind AND ec.spec_name = r.spec_name AND ec.rule_idx = r.idx
+      GROUP BY r.kind, r.spec_name, r.idx
+    )
+  SELECT DISTINCT 'bucket', b.bucket_input
+  FROM (SELECT kind, spec_name, min(idx) AS idx FROM rule_status
+        WHERE all_pass OR any_unsupported GROUP BY kind, spec_name) AS d
+    JOIN eval_rule_ctx AS b ON b.kind = d.kind AND b.spec_name = d.spec_name AND b.idx = d.idx
+  WHERE NOT EXISTS (SELECT 1 FROM hash_memo AS m WHERE m.algo = 'bucket' AND m.input = b.bucket_input);
 INSERT INTO eval_result (kind, name, bool, value, rule_id, group_name, secondary, undelegated,
     is_experiment_group, is_active, config_delegate, explicit_parameters, unsupported, unrecognized)
   WITH
@@ -539,7 +578,7 @@ INSERT INTO eval_result (kind, name, bool, value, rule_id, group_name, secondary
           THEN 'delegate'
         ELSE 'rule' END AS outcome,
       -- pass percentage: bucket of salt.ruleSalt.unitID
-      (SELECT CAST(m.output AS INTEGER) < CAST(json_extract(s.rule, '$.passPercentage') * 100 AS INTEGER)
+      (SELECT CAST(m.output AS INTEGER) < CAST(coalesce(json_extract(s.rule, '$.passPercentage'), 0) * 100 AS INTEGER)
        FROM eval_rule_ctx AS b JOIN hash_memo AS m ON m.algo = 'bucket' AND m.input = b.bucket_input
        WHERE b.kind = s.kind AND b.spec_name = s.name AND b.idx = s.decisive) AS passed,
       -- exposures of every condition up to and including the decisive rule

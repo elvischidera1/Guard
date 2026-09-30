@@ -17,10 +17,12 @@
 --   temp.*  per-client state (what the original SDK kept in memory). Each client owns a
 --           connection, so TEMP tables give every client its own session for free.
 
--- name: schema
-
+-- name: connect
 -- Per-client state is scratch data: keep TEMP tables in memory (the default is a temp file).
+-- Run once per connection, outside any transaction.
 PRAGMA temp_store = MEMORY;
+
+-- name: schema
 
 -- Durable ------------------------------------------------------------------------------------
 

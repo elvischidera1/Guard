@@ -110,7 +110,14 @@ class OnDeviceEvalAdapter(data: String?) {
             for (request in regexRequests) {
                 // The one thing SQLite cannot do portably: regular expressions (str_matches).
                 val result = try {
-                    if (Regex(request.string("pattern")!!).containsMatchIn(request.string("value")!!)) 1L else 0L
+                    if (Regex(
+                            request.string("pattern")!!
+                        ).containsMatchIn(request.string("value")!!)
+                    ) {
+                        1L
+                    } else {
+                        0L
+                    }
                 } catch (e: IllegalArgumentException) {
                     -1L
                 }
@@ -138,12 +145,13 @@ class OnDeviceEvalAdapter(data: String?) {
     private fun Row.onDeviceDetails() =
         onDeviceDetails(bool("unrecognized"), long("lcut"), long("received_at"))
 
-    private fun onDeviceDetails(unrecognized: Boolean, lcut: Long?, receivedAt: Long?) = EvalDetails(
-        EvalSource.OnDeviceEvalAdapterBootstrap,
-        if (unrecognized) EvalReason.Unrecognized else EvalReason.Recognized,
-        lcut = lcut ?: 0,
-        receivedAt = receivedAt
-    )
+    private fun onDeviceDetails(unrecognized: Boolean, lcut: Long?, receivedAt: Long?) =
+        EvalDetails(
+            EvalSource.OnDeviceEvalAdapterBootstrap,
+            if (unrecognized) EvalReason.Unrecognized else EvalReason.Recognized,
+            lcut = lcut ?: 0,
+            receivedAt = receivedAt
+        )
 }
 
 class UnsupportedEvaluationException(message: String) : Exception(message)

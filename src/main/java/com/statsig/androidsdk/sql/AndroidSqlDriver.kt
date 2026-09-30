@@ -1,6 +1,8 @@
 package com.statsig.androidsdk.sql
 
 import android.database.Cursor
+import android.database.CursorWindow
+import android.database.sqlite.SQLiteBlobTooBigException
 import android.database.sqlite.SQLiteCursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteProgram
@@ -12,8 +14,13 @@ import android.database.sqlite.SQLiteProgram
  * The SQL needs SQLite 3.38+ (JSON functions and the -> / ->> operators), i.e. Android 14 (API 34)
  * and newer. On older devices a bundled SQLite (e.g. androidx.sqlite's BundledSQLiteDriver or
  * requery's sqlite-android) can be plugged in through StatsigClient.sqlDriverFactory.
+ * CursorWindow(String, Long) and SQLiteBlobTooBigException need API 28, below the SQL's minimum.
  */
 internal class AndroidSqlDriver(path: String) : SqlDriver {
+    private companion object {
+        const val LARGE_WINDOW_BYTES = 64L * 1024 * 1024
+    }
+
     private val db: SQLiteDatabase = SQLiteDatabase.openOrCreateDatabase(path, null).apply {
         setMaxSqlCacheSize(SQLiteDatabase.MAX_SQL_CACHE_SIZE)
     }
@@ -25,16 +32,25 @@ internal class AndroidSqlDriver(path: String) : SqlDriver {
         }
     }
 
-    override fun query(sql: String, args: List<Any?>): List<Row> {
+    override fun query(sql: String, args: List<Any?>): List<Row> = try {
+        query(sql, args, null)
+    } catch (e: SQLiteBlobTooBigException) {
+        // A row larger than the default 2 MB cursor window (a big payload or event batch).
+        query(sql, args, LARGE_WINDOW_BYTES)
+    }
+
+    private fun query(sql: String, args: List<Any?>, windowBytes: Long?): List<Row> {
         // rawQuery only binds strings; a cursor factory gets to bind typed values.
         val factory = SQLiteDatabase.CursorFactory { _, driver, table, query ->
             bind(query, args)
-            SQLiteCursor(driver, table, query)
+            SQLiteCursor(driver, table, query).apply {
+                if (windowBytes != null) window = CursorWindow("statsig", windowBytes)
+            }
         }
         return db.rawQueryWithFactory(factory, sql, null, null).use { cursor -> read(cursor) }
     }
 
-    override fun beginTransaction() = db.beginTransaction()
+    override fun beginTransaction() = db.beginTransactionNonExclusive()
 
     override fun commit() {
         db.setTransactionSuccessful()

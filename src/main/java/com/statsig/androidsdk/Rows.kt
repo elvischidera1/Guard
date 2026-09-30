@@ -103,7 +103,9 @@ internal fun Row.toLayer(client: StatsigClient?): Layer {
             bool("is_device_based"),
             string("allocated_experiment_name"),
             jsonStrings(string("explicit_parameters")),
-            string("parameter_rule_ids")?.let { json -> jsonMap(json).mapValues { it.value.toString() } }
+            string("parameter_rule_ids")?.let { json ->
+                jsonMap(json).mapValues { it.value.toString() }
+            }
         )
     }
 }

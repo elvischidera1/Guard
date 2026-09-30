@@ -5,15 +5,23 @@ package com.statsig.androidsdk.sql
  * than once); its result is the rows of its last row-returning statement. Access is serialized: the SDK is called from many
  * threads and a SQLite connection must not be.
  */
-internal class StatsigDb(private val driver: SqlDriver, private val script: SqlScript = SqlScript.default) {
+internal class StatsigDb(
+    private val driver: SqlDriver,
+    private val script: SqlScript = SqlScript.default
+) {
 
     init {
+        run("connect")
         run("schema")
     }
+
+    @Volatile
+    private var closed = false
 
     fun run(block: String, params: Map<String, Any?> = emptyMap()): List<Row> {
         val statements = script.block(block)
         synchronized(this) {
+            check(!closed) { "Statsig database is closed" }
             // A block with at most one write is atomic by itself; only others need a transaction.
             if (statements.count { !it.returnsRows } <= 1) {
                 var result: List<Row> = emptyList()
@@ -29,15 +37,21 @@ internal class StatsigDb(private val driver: SqlDriver, private val script: SqlS
                 driver.commit()
                 return result
             } catch (e: Throwable) {
-                driver.rollback()
+                runCatching { driver.rollback() }.exceptionOrNull()?.let { e.addSuppressed(it) }
                 throw e
             }
         }
     }
 
-    fun one(block: String, params: Map<String, Any?> = emptyMap()): Row? = run(block, params).firstOrNull()
+    fun one(block: String, params: Map<String, Any?> = emptyMap()): Row? =
+        run(block, params).firstOrNull()
 
-    fun close() = synchronized(this) { driver.close() }
+    fun close() = synchronized(this) {
+        if (!closed) {
+            closed = true
+            driver.close()
+        }
+    }
 
     private fun exec(statement: SqlScript.Statement, params: Map<String, Any?>): List<Row>? {
         val args = statement.params.map { name ->
